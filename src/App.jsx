@@ -23,9 +23,9 @@ const PITCH_OFFSETS = {
 };
 
 function App() {
-  const [input, setInput] = useState("1 2 3 1' 5,");
-  const [notes, setNotes] = useState([]);
-  const svgRef = useRef(null);
+  const [blocks, setBlocks] = useState(["1 2 3 1' 5,"]);
+  const [parsedBlocks, setParsedBlocks] = useState([]);
+  const svgRefs = useRef([]); // Array of refs for multiple SVGs
 
   // Persistence State
   const [title, setTitle] = useState("Untitled Melody");
@@ -34,13 +34,25 @@ function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [dbError, setDbError] = useState(null);
 
-  // Load Library on Mount
+  // User Identity (Simple LocalStorage UUID)
+  const [userId, setUserId] = useState(null);
+
   useEffect(() => {
+    // 1. Initialize User ID
+    let storedId = localStorage.getItem('jianpu_user_id');
+    if (!storedId) {
+      storedId = 'user_' + Math.random().toString(36).substr(2, 9);
+      localStorage.setItem('jianpu_user_id', storedId);
+    }
+    setUserId(storedId);
+
+    // 2. Load Library
     fetchLibrary();
   }, []);
 
   const fetchLibrary = async () => {
     try {
+      // Fetch all, we'll filter UI actions by owner_id on the client
       const result = await turso.execute("SELECT * FROM melodies ORDER BY created_at DESC LIMIT 50");
       setLibrary(result.rows);
       setDbError(null);
@@ -59,18 +71,65 @@ function App() {
         return;
       }
 
-      await turso.execute({
-        sql: "INSERT INTO melodies (title, album, content, key_index, bpm) VALUES (?, ?, ?, ?, ?)",
-        args: [title, album, input, selectedKeyIndex, bpm]
-      });
+      // Check for existing melody by this owner with same title/album
+      let existingId = null;
+      try {
+        const check = await turso.execute({
+          sql: "SELECT id FROM melodies WHERE title = ? AND album = ? AND owner_id = ?",
+          args: [title, album || "", userId]
+        });
+        if (check.rows.length > 0) {
+          existingId = check.rows[0].id;
+        }
+      } catch (e) {
+        console.warn("Check failed", e);
+      }
+
+      if (existingId) {
+        if (confirm(`Overwrite existing "${title}" in "${album || 'Uncategorized'}"?`)) {
+          await turso.execute({
+            sql: "UPDATE melodies SET content = ?, key_index = ?, bpm = ? WHERE id = ?",
+            args: [JSON.stringify(blocks), selectedKeyIndex, bpm, existingId]
+          });
+          alert("Melody updated!");
+        } else {
+          setIsSaving(false);
+          return;
+        }
+      } else {
+        await turso.execute({
+          sql: "INSERT INTO melodies (title, album, content, key_index, bpm, owner_id) VALUES (?, ?, ?, ?, ?, ?)",
+          args: [title, album, JSON.stringify(blocks), selectedKeyIndex, bpm, userId]
+        });
+        alert("Melody saved!");
+      }
 
       await fetchLibrary(); // Refresh list
-      alert("Melody saved!");
     } catch (e) {
       console.error("Save failed:", e);
-      alert("Failed to save: " + e.message);
+      if (e.message.includes("no such column: owner_id")) {
+        alert("Database Error: Missing 'owner_id' column. Please run the SQL migration.");
+      } else {
+        alert("Failed to save: " + e.message);
+      }
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const deleteMelody = async (e, item) => {
+    e.stopPropagation(); // Prevent loading when clicking delete
+    if (!confirm(`Are you sure you want to delete "${item.title}"?`)) return;
+
+    try {
+      await turso.execute({
+        sql: "DELETE FROM melodies WHERE id = ?",
+        args: [item.id]
+      });
+      await fetchLibrary(); // Refresh
+    } catch (e) {
+      console.error("Delete failed:", e);
+      alert("Failed to delete: " + e.message);
     }
   };
 
@@ -78,9 +137,39 @@ function App() {
     if (confirm(`Load "${item.title}"? Unsaved changes will be lost.`)) {
       setTitle(item.title);
       setAlbum(item.album || "");
-      setInput(item.content);
+
+      try {
+        const loadedContent = JSON.parse(item.content);
+        if (Array.isArray(loadedContent)) {
+          setBlocks(loadedContent);
+        } else {
+          // Fallback for legacy single-string data
+          setBlocks([item.content]);
+        }
+      } catch (e) {
+        // Fallback if parsing fails
+        setBlocks([item.content]);
+      }
+
       setSelectedKeyIndex(item.key_index || 0);
       setBpm(item.bpm || 60);
+    }
+  };
+
+  const updateBlock = (index, value) => {
+    const newBlocks = [...blocks];
+    newBlocks[index] = value;
+    setBlocks(newBlocks);
+  };
+
+  const addBlock = () => {
+    setBlocks([...blocks, ""]);
+  };
+
+  const removeBlock = (index) => {
+    if (blocks.length > 1) {
+      const newBlocks = blocks.filter((_, i) => i !== index);
+      setBlocks(newBlocks);
     }
   };
 
@@ -88,6 +177,7 @@ function App() {
     const parsed = [];
     const currentScale = SCALE_TYPES[keyIndex] || SCALE_TYPES[0];
     const isNumbersMode = currentScale.name === 'Numbers Only';
+    let totalDuration = 0;
 
     // Regex for tokenizing complex Jianpu syntax
     // 1. Bar lines/Repeat signs: :|: or |: or :| or ||| or || or |
@@ -103,7 +193,7 @@ function App() {
       if (/^[\|:\[]/.test(token)) {
         parsed.push({
           type: 'bar',
-          text: token // store "||" or "|:" to draw later
+          text: token
         });
         i++;
         continue;
@@ -119,10 +209,8 @@ function App() {
         let accidental = 0; // -1 flat, 1 sharp
         let duration = 1; // Quarter default
 
-        // Parse modifiers character by character (or regex count)
         const sharps = (modifiers.match(/#/g) || []).length;
         const flats = (modifiers.match(/b/g) || []).length;
-        // Reset if 'n' natural is found? (Not strictly used in this simple visualizer yet but good to track)
         if (modifiers.includes('n')) accidental = 0;
         else accidental = sharps - flats;
 
@@ -131,50 +219,25 @@ function App() {
         const lowOctaves = (modifiers.match(/,/g) || []).length;
         octave = (highOctaves * 1) + (doubleHigh * 2) - lowOctaves;
 
-        // Rhythm Calculation
-        // _ underscore = halve duration. 3_ = 0.5. 3__ = 0.25
         const underscoreCount = (modifiers.match(/_/g) || []).length;
-
-        // = equals = sixteenth (0.25). 
-        // If = is present, does it override _ ? User says 1= sixteenth. 
-        // Let's treat = as setting base to 0.25
         const equalsCount = (modifiers.match(/=/g) || []).length;
-
-        // - dash = extend. 1- = half (add 1). 1-- = dotted half (add 2).
         const dashCount = (modifiers.match(/-/g) || []).length;
-
-        // . dot = 1.5x
         const dotCount = (modifiers.match(/\./g) || []).length;
 
-        // Calculate final duration
         if (equalsCount > 0) {
           duration = 0.25;
         } else if (underscoreCount > 0) {
           duration = Math.pow(0.5, underscoreCount);
         }
 
-        // Apply dashes (extensions)
-        // Usually dashes are separate tokens in Jianpu (1 - -), but user provided "1-" syntax.
-        // If dashes are part of the token, we assume they add quarters.
-        // But if we already calculated quarters/eighths... 
-        // Let's assume standard behavior: 1- means 1 (quarter) + 1 (quarter) = 2.
         duration += dashCount;
 
-        // Apply dots
-        if (dotCount > 0) {
-          // Standard 1. is 1 + 0.5 = 1.5
-          // Standard 1-. is 2 + 1 = 3? 
-          // Simple multiply for now
-          duration *= 1.5;
-        }
+        if (dotCount > 0) duration *= 1.5;
+
+        totalDuration += duration;
 
         // VISUAL LABEL
         let visualLabel = currentScale.notes[noteNum - 1];
-
-        // Append accidental to visual label if not in key? 
-        // Or if strictly accidental. 
-        // Logic: If user inputs 1#, they mean "Sharp 1". 
-        // In G Major (1=G), 1# is G#. 
         if (accidental === 1) visualLabel += '#';
         if (accidental === -1) visualLabel += 'b';
 
@@ -202,17 +265,38 @@ function App() {
         i++;
       }
     }
-    setNotes(parsed);
+    return { notes: parsed, totalDuration };
   };
 
-  const handleDownload = () => {
-    if (!svgRef.current) return;
-    const svgData = new XMLSerializer().serializeToString(svgRef.current);
+  const normalizeFilename = (text) => {
+    if (!text) return "";
+    return text
+      .trim()
+      .replace(/[^a-zA-Z0-9\s-_]/g, "") // Remove special chars
+      .replace(/\s+/g, "_"); // Replace spaces with underscores
+  };
+
+  const handleDownloadSection = (index) => {
+    const svgEl = svgRefs.current[index];
+    if (!svgEl) return;
+
+    const serializer = new XMLSerializer();
+    const svgData = serializer.serializeToString(svgEl);
+
+    const normAlbum = normalizeFilename(album);
+    const normTitle = normalizeFilename(title) || "Untitled";
+
+    // Format: Album_Title_Section_1.svg (skip album if empty)
+    let filename = `${normTitle}_Section_${index + 1}.svg`;
+    if (normAlbum) {
+      filename = `${normAlbum}_${normTitle}_Section_${index + 1}.svg`;
+    }
+
     const blob = new Blob([svgData], { type: "image/svg+xml;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "melody_visualization.svg";
+    link.download = filename;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -232,51 +316,45 @@ function App() {
     { name: 'Eb Major', root: 'Eb', notes: ['Eb', 'F', 'G', 'Ab', 'Bb', 'C', 'D'] },
     { name: 'Bb Major', root: 'Bb', notes: ['Bb', 'C', 'D', 'Eb', 'F', 'G', 'A'] },
     { name: 'F Major', root: 'F', notes: ['F', 'G', 'A', 'Bb', 'C', 'D', 'E'] },
-    // Numbers Mode special case
     { name: 'Numbers Only', root: 'C', notes: ['1', '2', '3', '4', '5', '6', '7'] }
   ];
 
   const [selectedKeyIndex, setSelectedKeyIndex] = useState(0); // Default C Major
 
   // Map scale degree (1-7) to semitone interval from C for MIDI calculation
-  // We need this because playback always needs absolute pitch
   const SEMITONE_OFFSETS = [0, 2, 4, 5, 7, 9, 11];
 
   useEffect(() => {
-    parseInput(input, selectedKeyIndex);
-  }, [input, selectedKeyIndex]);
+    const results = blocks.map(block => parseInput(block, selectedKeyIndex));
+    setParsedBlocks(results);
+  }, [blocks, selectedKeyIndex]);
 
   // Dimensions & Scaling
   const [kerning, setKerning] = useState(40); // User adjustable spacing
   const [verticalScale, setVerticalScale] = useState(20); // Scale for pitch height difference
 
-  // Calculate dynamic dimensions for tight fit
-  const validNotes = notes.filter(n => n.type === 'note');
+  const calculateCanvasSize = (notes) => {
+    let width = 800;
+    let height = 200;
+    let baseY = 100;
 
-  let CANVAS_WIDTH = 800;
-  let CANVAS_HEIGHT = 400;
-  let BASE_Y = 200;
+    const validNotes = notes.filter(n => n.type === 'note');
+    if (validNotes.length > 0) {
+      const PADDING_X = 40;
+      const PADDING_Y = 60;
 
-  if (validNotes.length > 0) {
-    const PADDING_X = 40;
-    const PADDING_Y = 60; // Enough for font height
+      width = Math.max(100, ((validNotes.length - 1) * kerning) + PADDING_X);
 
-    CANVAS_WIDTH = Math.max(100, ((validNotes.length - 1) * kerning) + PADDING_X);
+      const pitches = validNotes.map(n => n.pitchIndex);
+      const minPitch = Math.min(...pitches);
+      const maxPitch = Math.max(...pitches);
 
-    const pitches = validNotes.map(n => n.pitchIndex);
-    const minPitch = Math.min(...pitches);
-    const maxPitch = Math.max(...pitches);
-
-    // Highest note (visually top, lowest Y value) = -maxPitch * scale
-    // Lowest note (visually bottom, highest Y value) = -minPitch * scale
-    const heightRange = (maxPitch - minPitch) * verticalScale;
-    CANVAS_HEIGHT = heightRange + PADDING_Y;
-
-    // We want the highest note (-maxPitch * scale) to be at Y = PADDING_Y / 2
-    // So: BASE_Y - (maxPitch * scale) = PADDING_Y / 2
-    // BASE_Y = (maxPitch * scale) + (PADDING_Y / 2)
-    BASE_Y = (maxPitch * verticalScale) + (PADDING_Y / 2);
-  }
+      const heightRange = (maxPitch - minPitch) * verticalScale;
+      height = heightRange + PADDING_Y;
+      baseY = (maxPitch * verticalScale) + (PADDING_Y / 2);
+    }
+    return { width, height, baseY };
+  };
 
   // Audio Playback
   const [isPlaying, setIsPlaying] = useState(false);
@@ -288,7 +366,6 @@ function App() {
 
     await Tone.start();
 
-    // Create a simple synth with a "piano-like" envelope
     const synth = new Tone.PolySynth(Tone.Synth, {
       oscillator: { type: "triangle" },
       envelope: {
@@ -300,35 +377,35 @@ function App() {
       volume: -5
     }).toDestination();
 
-    // Filter output to dampen brightness (closer to piano)
     const filter = new Tone.Filter(800, "lowpass").toDestination();
     synth.connect(filter);
 
     const now = Tone.now();
-    let timeOffset = 0;
-
-    // Beats Per Minute to seconds per beat
-    // This assumes each note is an 8th note for now (0.5 beats in X/4 time?) 
-    // If the request implies "inputs are quarter notes", spacing is 60/BPM seconds.
-    // Let's assume input notes are even quarter notes for this visualization.
     const secondsPerBeat = 60 / bpm;
+    let globalTimeOffset = 0;
 
-    notes.forEach((note) => {
-      if (note.type !== 'note') return;
+    // Sequential Playback
+    parsedBlocks.forEach((blockResult) => {
+      let blockTimeOffset = 0;
 
-      const frequency = Tone.Frequency(note.midiVal, "midi").toFrequency();
-      // Use full beat duration, slightly shorter release for articulation
-      const durationSeconds = note.duration * secondsPerBeat;
-      synth.triggerAttackRelease(frequency, durationSeconds * 0.9, now + timeOffset);
-      timeOffset += durationSeconds;
+      blockResult.notes.forEach((note) => {
+        if (note.type !== 'note') return;
+
+        const frequency = Tone.Frequency(note.midiVal, "midi").toFrequency();
+        const durationSeconds = note.duration * secondsPerBeat;
+        synth.triggerAttackRelease(frequency, durationSeconds * 0.9, now + globalTimeOffset + blockTimeOffset);
+        blockTimeOffset += durationSeconds;
+      });
+
+      // Add this block's total duration to the global offset so next block starts after
+      globalTimeOffset += blockResult.totalDuration * secondsPerBeat;
     });
 
-    // Cleanup state after playing
     setTimeout(() => {
       setIsPlaying(false);
-      synth.dispose(); // Dispose of the synth after use
-      filter.dispose(); // Dispose of the filter after use
-    }, timeOffset * 1000);
+      synth.dispose();
+      filter.dispose();
+    }, globalTimeOffset * 1000 + 500); // Buffer
   };
 
   return (
@@ -359,11 +436,24 @@ function App() {
             <div
               key={item.id}
               onClick={() => loadMelody(item)}
-              className="p-3 rounded-lg bg-bg-primary hover:bg-glass-surface cursor-pointer transition-colors border border-transparent hover:border-teal-500 group"
+              className="p-3 rounded-lg bg-bg-primary hover:bg-glass-surface cursor-pointer transition-colors border border-transparent hover:border-teal-500 group relative"
             >
-              <div className="font-bold text-white text-sm group-hover:text-teal-400 truncate">{item.title}</div>
-              {item.album && <div className="text-xs text-text-muted truncate">{item.album}</div>}
+              <div className="font-bold text-white text-sm group-hover:text-teal-400 truncate pr-6">{item.title}</div>
+              {item.album && <div className="text-xs text-text-muted truncate pr-6">{item.album}</div>}
               <div className="text-[10px] text-gray-500 mt-1">{new Date(item.created_at).toLocaleDateString()}</div>
+
+              {/* Delete Button (Only if Owner) */}
+              {item.owner_id === userId && (
+                <button
+                  onClick={(e) => deleteMelody(e, item)}
+                  className="absolute top-2 right-2 text-gray-600 hover:text-red-500 transition-colors bg-base-100/50 rounded p-1"
+                  title="Delete"
+                >
+                  <svg width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                  </svg>
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -405,25 +495,43 @@ function App() {
           {/* Controls & Input */}
           <div className="flex flex-col gap-6">
 
-            <div className="flex flex-col md:flex-row gap-6">
-              <div className="flex flex-col gap-2 flex-grow-[2]">
+            <div className="flex flex-col gap-6">
+              <div className="flex justify-between items-center">
                 <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
-                  Input Notation
+                  Melody Sections
                 </label>
-                <input
-                  type="text"
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  placeholder="e.g. 1 2 3 4 5 6 7 1'"
-                  className="w-full font-mono text-lg bg-bg-secondary border border-glass-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-teal-500"
-                  spellCheck={false}
-                />
-                <div className="text-xs text-text-muted">
-                  1-7 = Notes | ' = High Octave | " = Double High | , = Low Octave
-                </div>
+                <button onClick={addBlock} className="text-xs bg-bg-secondary hover:bg-glass-border px-3 py-1 rounded border border-glass-border transition-colors">
+                  + Add Section
+                </button>
               </div>
 
-              <div className="flex flex-col gap-2 flex-1">
+              {blocks.map((blockContent, index) => (
+                <div key={index} className="flex gap-2">
+                  <div className="flex-grow relative">
+                    <span className="absolute left-[-25px] top-3 text-text-muted text-xs font-mono">{index + 1}.</span>
+                    <input
+                      type="text"
+                      value={blockContent}
+                      onChange={(e) => updateBlock(index, e.target.value)}
+                      placeholder={`Section ${index + 1} notes...`}
+                      className="w-full font-mono text-lg bg-bg-secondary border border-glass-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-teal-500"
+                      spellCheck={false}
+                    />
+                  </div>
+                  {blocks.length > 1 && (
+                    <button
+                      onClick={() => removeBlock(index)}
+                      className="px-3 py-2 bg-red-900/30 text-red-400 hover:bg-red-900/50 rounded-lg border border-red-900/50 transition-colors"
+                      title="Remove Section"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+              ))}
+
+
+              <div className="flex flex-col gap-2 flex-1 mt-4">
                 <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
                   Key / Mode
                 </label>
@@ -438,6 +546,7 @@ function App() {
                 </select>
               </div>
             </div>
+
 
             <div className="flex flex-col md:flex-row gap-8">
               <div className="flex flex-col gap-2 flex-1">
@@ -470,79 +579,65 @@ function App() {
             </div>
           </div>
 
-          {/* Visualization Output - Styled like a White Paper / Card */}
-          <div className="rounded-xl overflow-hidden bg-white shadow-xl border-4 border-white">
-            <div className="overflow-x-auto">
-              <div style={{ width: CANVAS_WIDTH, height: CANVAS_HEIGHT }} className="relative mx-auto bg-white text-black">
-                {notes.length === 0 ? (
-                  <div className="absolute inset-0 flex items-center justify-center text-gray-400 font-sans opacity-50">
-                    Enter notes to generate preview...
+          {/* Visualization Output - Multiple Stacked SVGs */}
+          <div className="flex flex-col gap-4">
+
+            {parsedBlocks.map((blockResult, bIndex) => {
+              const { width, height, baseY } = calculateCanvasSize(blockResult.notes);
+              return (
+                <div key={bIndex} className="rounded-xl overflow-hidden bg-white shadow-xl border-4 border-white relative group">
+                  {/* Label for the section */}
+                  <div className="absolute top-2 left-2 text-gray-400 text-xs font-bold uppercase tracking-widest pointer-events-none">
+                    Section {bIndex + 1}
                   </div>
-                ) : (
-                  <svg
-                    ref={svgRef}
-                    width={CANVAS_WIDTH}
-                    height={CANVAS_HEIGHT}
-                    xmlns="http://www.w3.org/2000/svg"
-                    className="block"
+
+                  {/* Download Button (Appears on Hover) */}
+                  <button
+                    onClick={() => handleDownloadSection(bIndex)}
+                    className="absolute top-2 right-2 bg-gray-100 hover:bg-gray-200 text-gray-600 p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 z-10"
+                    title="Download SVG"
                   >
-                    {notes.filter(item => item.type === 'note').map((item, index) => {
-                      // Start from offset (20px which is PADDING_X/2)
-                      const x = 20 + index * kerning;
+                    <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                    </svg>
+                  </button>
 
-                      // It is a note
-                      // Vertical pos calculated with the dynamic scale
-                      const y = BASE_Y - (item.pitchIndex * verticalScale);
+                  <div className="overflow-x-auto">
+                    <div style={{ width: width, height: height }} className="relative mx-auto bg-white text-black">
+                      {blockResult.notes.length === 0 ? (
+                        <div className="absolute inset-0 flex items-center justify-center text-gray-400 font-sans opacity-50">
+                          ...
+                        </div>
+                      ) : (
+                        <svg
+                          ref={el => svgRefs.current[bIndex] = el}
+                          width={width}
+                          height={height}
+                          xmlns="http://www.w3.org/2000/svg"
+                          className="block"
+                        >
+                          {blockResult.notes.filter(item => item.type === 'note').map((item, index) => {
+                            const x = 20 + index * kerning;
+                            const y = baseY - (item.pitchIndex * verticalScale);
+                            const match = item.note.match(/^([A-Ga-g1-7])([#b]?)/);
+                            let base = item.note;
+                            let acc = '';
+                            if (match) { base = match[1]; acc = match[2]; }
 
-                      // Split note and accidental for formatting
-                      // Regex: First char is note (A-G), rest is accidental (#, b)
-                      // But we used logic to construct label. 
-                      // Use regex to separate letter from accidental symbols
-                      const match = item.note.match(/^([A-Ga-g1-7])([#b]?)/);
-                      let base = item.note;
-                      let acc = '';
-
-                      if (match) {
-                        base = match[1];
-                        acc = match[2];
-                      }
-
-                      return (
-                        <g key={index}>
-                          {/* Base Note */}
-                          <text
-                            x={x}
-                            y={y}
-                            dy="0.35em"
-                            textAnchor="middle"
-                            fill="#000000"
-                            fontWeight="500"
-                            fontFamily="sans-serif"
-                            fontSize="24"
-                          >
-                            {base}
-                          </text>
-                          {/* Accidental - Rendered separately for robust export */}
-                          {acc && (
-                            <text
-                              x={x + 10}
-                              y={y - 8}
-                              textAnchor="start"
-                              fill="#000000"
-                              fontWeight="bold"
-                              fontFamily="sans-serif"
-                              fontSize="14"
-                            >
-                              {acc}
-                            </text>
-                          )}
-                        </g>
-                      );
-                    })}
-                  </svg>
-                )}
-              </div>
-            </div>
+                            return (
+                              <g key={index}>
+                                <text x={x} y={y} dy="0.35em" textAnchor="middle" fill="#000000" fontWeight="500" fontFamily="sans-serif" fontSize="24">{base}</text>
+                                {acc && <text x={x + 10} y={y - 8} textAnchor="start" fill="#000000" fontWeight="bold" fontFamily="sans-serif" fontSize="14">{acc}</text>}
+                              </g>
+                            );
+                          })}
+                        </svg>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
           </div>
 
           {/* Footer Controls */}
@@ -550,9 +645,9 @@ function App() {
             <div className="flex flex-col md:flex-row items-center gap-4 w-full md:w-auto">
               <button
                 onClick={playMelody}
-                disabled={isPlaying || notes.length === 0}
+                disabled={isPlaying}
                 className={`flex items-center gap-2 px-6 py-2 rounded-lg font-semibold transition-all shadow-lg w-full md:w-auto justify-center
-                  ${isPlaying || notes.length === 0
+                  ${isPlaying
                     ? 'bg-gray-700 text-gray-400 cursor-not-allowed'
                     : 'bg-gradient-to-r from-teal-500 to-teal-700 text-white hover:translate-y-[-2px] hover:shadow-cyan-500/20'}`}
               >
@@ -564,7 +659,7 @@ function App() {
                   )}
                   {isPlaying && <rect x="14" y="4" width="4" height="16" rx="1" />}
                 </svg>
-                {isPlaying ? 'Playing...' : 'Play Melody'}
+                {isPlaying ? 'Playing...' : 'Play Sequence'}
               </button>
 
               <div className="flex items-center gap-2">
@@ -582,17 +677,10 @@ function App() {
               </div>
             </div>
 
-            <div className="flex items-center gap-4 w-full md:w-auto justify-center md:justify-end">
-              <span className="text-sm text-text-muted hidden md:inline">
-                SVG Output
-              </span>
-              <button onClick={handleDownload} className="btn-primary flex items-center gap-2 w-full md:w-auto justify-center">
-                <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                </svg>
-                Download SVG
-              </button>
+            <div className="flex items-center gap-4 w-full md:w-auto justify-center md:justify-end text-sm text-text-muted">
+              <span className="hidden md:inline">Hover over sections to download SVG</span>
             </div>
+
           </div>
         </div>
       </div>
