@@ -1,6 +1,9 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import * as Tone from 'tone';
+import { PitchDetector } from 'pitchy';
 import { turso } from './tursoClient';
+import { parseMusicXML } from './MusicXMLParser';
 
 const NOTE_MAP = {
   1: 'C',
@@ -22,8 +25,254 @@ const PITCH_OFFSETS = {
   7: 6
 };
 
+const SEMITONE_OFFSETS = [0, 2, 4, 5, 7, 9, 11];
+
+const SCALE_TYPES = [
+  { name: 'C Major', root: 'C', notes: ['C', 'D', 'E', 'F', 'G', 'A', 'B'] },
+  { name: 'G Major', root: 'G', notes: ['G', 'A', 'B', 'C', 'D', 'E', 'F#'] },
+  { name: 'D Major', root: 'D', notes: ['D', 'E', 'F#', 'G', 'A', 'B', 'C#'] },
+  { name: 'A Major', root: 'A', notes: ['A', 'B', 'C#', 'D', 'E', 'F#', 'G#'] },
+  { name: 'E Major', root: 'E', notes: ['E', 'F#', 'G#', 'A', 'B', 'C#', 'D#'] },
+  { name: 'B Major', root: 'B', notes: ['B', 'C#', 'D#', 'E', 'F#', 'G#', 'A#'] },
+  { name: 'F# Major', root: 'F#', notes: ['F#', 'G#', 'A#', 'B', 'C#', 'D#', 'E#'] },
+  { name: 'Db Major', root: 'Db', notes: ['Db', 'Eb', 'F', 'Gb', 'Ab', 'Bb', 'C'] },
+  { name: 'Ab Major', root: 'Ab', notes: ['Ab', 'Bb', 'C', 'Db', 'Eb', 'F', 'G'] },
+  { name: 'Eb Major', root: 'Eb', notes: ['Eb', 'F', 'G', 'Ab', 'Bb', 'C', 'D'] },
+  { name: 'Bb Major', root: 'Bb', notes: ['Bb', 'C', 'D', 'Eb', 'F', 'G', 'A'] },
+  { name: 'F Major', root: 'F', notes: ['F', 'G', 'A', 'Bb', 'C', 'D', 'E'] },
+  { name: 'Numbers Only', root: 'C', notes: ['1', '2', '3', '4', '5', '6', '7'] }
+];
+
 function App() {
-  const [blocks, setBlocks] = useState(["1 2 3 1' 5,"]);
+  // --- Audio Transcription State ---
+  const [recordingBlockIndex, setRecordingBlockIndex] = useState(null); // replaces isMicActive
+  const recordingBlockRef = useRef(null); // Ref to avoid stale closures in loop
+
+  const [detectedNoteLabel, setDetectedNoteLabel] = useState("");
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const streamRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const detectorRef = useRef(null);
+  const inputBufferRef = useRef(null);
+  const lastNoteRef = useRef({ midi: null, firstSeen: 0 });
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopMic();
+    };
+  }, []);
+
+
+  const playReferenceChords = async () => {
+    // Force Key to C Major (Index 0 in SCALE_TYPES)
+    setSelectedKeyIndex(0);
+    setDetectedNoteLabel("Playing Reference...");
+
+    await Tone.start();
+    const synth = new Tone.PolySynth(Tone.Synth).toDestination();
+    synth.volume.value = -10;
+
+    const now = Tone.now();
+    // Chord C: C4, E4, G4
+    synth.triggerAttackRelease(["C4", "E4", "G4"], "0.8", now);
+    // Chord F: F4, A4, C5
+    synth.triggerAttackRelease(["F4", "A4", "C5"], "0.8", now + 1);
+    // Chord C: C4, E4, G4
+    synth.triggerAttackRelease(["C4", "E4", "G4"], "1.5", now + 2);
+
+    // Wait for playback to finish (3 seconds) before resolving
+    return new Promise(resolve => setTimeout(resolve, 3200));
+  };
+
+  const toggleMic = async (index) => {
+    // Stop if active
+    if (recordingBlockRef.current !== null) {
+      const wasSameIndex = recordingBlockRef.current === index;
+      stopMic();
+      if (wasSameIndex) return; // Toggle OFF behavior
+    }
+
+    // Start Recording sequence
+    setRecordingBlockIndex(index);
+    recordingBlockRef.current = index; // Sync Ref
+
+    try {
+      // 1. Play Reference Chords (C -> F -> C)
+      await playReferenceChords();
+
+      // Check if user cancelled during playback
+      if (recordingBlockRef.current !== index) return;
+
+      // 2. Start Input
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      audioContextRef.current = audioContext;
+
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      analyserRef.current = analyser;
+
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      // Pitchy Setup
+      detectorRef.current = PitchDetector.forFloat32Array(analyser.fftSize);
+      inputBufferRef.current = new Float32Array(detectorRef.current.inputLength);
+
+      setDetectedNoteLabel("Listening...");
+      detectPitchLoop();
+
+    } catch (err) {
+      console.error("Mic Error:", err);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        alert("Permission Denied: Please allow microphone access in your browser settings.");
+      } else {
+        alert("Microphone Error: " + err.message);
+      }
+      stopMic();
+    }
+  };
+
+  const stopMic = () => {
+    setRecordingBlockIndex(null);
+    recordingBlockRef.current = null; // Sync Ref
+    setDetectedNoteLabel("");
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    analyserRef.current = null;
+    detectorRef.current = null;
+  };
+
+  const detectPitchLoop = () => {
+    if (!analyserRef.current || !detectorRef.current) return;
+    if (!streamRef.current || !streamRef.current.active) return;
+
+    const analyser = analyserRef.current;
+    const detector = detectorRef.current;
+    const buffer = inputBufferRef.current;
+
+    analyser.getFloatTimeDomainData(buffer);
+
+    // Pitchy: findPitch(buffer, sampleRate) -> [pitch, clarity]
+    const [pitch, clarity] = detector.findPitch(buffer, audioContextRef.current.sampleRate);
+
+    if (clarity > 0.8 && pitch > 60 && pitch < 2000) { // Thresholds: Clarity > 80%, Hz range
+      processDetectedPitch(pitch);
+    } else {
+      lastNoteRef.current = { midi: null, firstSeen: 0 };
+      // Keep label if just transient noise, or clear?
+      // setDetectedNoteLabel("..."); 
+    }
+
+    requestAnimationFrame(() => detectPitchLoop());
+  };
+
+  const processDetectedPitch = (frequency) => {
+    // 1. Hz -> MIDI
+    const midiNum = Math.round(69 + 12 * Math.log2(frequency / 440));
+    const noteName = Tone.Frequency(midiNum, "midi").toNote();
+
+    // Debug Log (throttled/occasional would be better, but explicit is good now)
+    // console.log("Pitch:", noteName, midiNum); 
+
+    setDetectedNoteLabel(noteName);
+
+    // 2. Stability Check
+    const now = Date.now();
+    if (lastNoteRef.current.midi === midiNum) {
+      if (now - lastNoteRef.current.firstSeen > 300) {
+        addNoteFromMidi(midiNum);
+        lastNoteRef.current = { midi: null, firstSeen: now + 500 };
+      }
+    } else {
+      lastNoteRef.current = { midi: midiNum, firstSeen: now };
+    }
+  };
+
+  const addNoteFromMidi = (midi) => {
+    // Guards
+    // Check Ref ensures we have latest value in closure
+    if (recordingBlockRef.current === null) return;
+
+    // Quantize MIDI to Scale Degree (1-7)
+    // Use selectedKeyIndex to identify Root
+    // This is the hard part: Map absolute MIDI to relative Jianpu '1 2 3'
+
+    // Use REF for key index to avoid stale closure
+    const currentScale = SCALE_TYPES[selectedKeyRef.current];
+    const rootNote = currentScale.root;
+
+    // Debug
+    console.log(`Detected: ${midi}, Key: ${rootNote}, Block: ${recordingBlockRef.current}`);
+
+    if (currentScale.name === 'Numbers Only') return;
+
+    const rootMidi = Tone.Frequency(rootNote + "4").toMidi();
+
+    // Calculate semitone difference from Root
+    // We need to normalize octaves.
+    // e.g. Key=G(67). Sung=G4(67) -> 1. Sung=G5(79) -> 1'.
+
+    let relativeSemitones = midi - rootMidi;
+
+    // Calculate Octave Shift
+    let octave = Math.floor(relativeSemitones / 12);
+    let semitoneInScale = ((relativeSemitones % 12) + 12) % 12; // 0-11 positive
+
+    // Map semitoneInScale to Degree (1-7)
+    // Major Scale Intervals: 0, 2, 4, 5, 7, 9, 11
+    const INTERVAL_Map = {
+      0: '1', 2: '2', 4: '3', 5: '4', 7: '5', 9: '6', 11: '7'
+    };
+
+    // If sung pitch is not in scale (e.g. 1#), ignore or map to nearest?
+    // MVP: Only accept diatonic notes.
+    let degree = INTERVAL_Map[semitoneInScale];
+    if (!degree) {
+      console.log("Ignored chromatic:", semitoneInScale);
+      return;
+    }
+
+    // Format String
+    let noteStr = degree;
+    if (octave > 0) noteStr += "'".repeat(octave);
+    if (octave < 0) noteStr += ",".repeat(Math.abs(octave));
+
+    console.log("Adding Note String:", noteStr);
+
+    // Append to the SPECIFIC block being recorded
+    setBlocks(prev => {
+      const newBlocks = [...prev];
+      // Use Ref for correct index
+      const idx = recordingBlockRef.current;
+      if (idx === null || idx >= newBlocks.length) return prev;
+
+      const oldBlock = newBlocks[idx];
+      // Check if it's a melody block before adding notes
+      // We assume recording is only for melody sections for now
+      const contentStr = typeof oldBlock === 'string' ? oldBlock : (oldBlock.content || '');
+
+      const newContentStr = (contentStr + " " + noteStr).trim();
+
+      newBlocks[idx] = typeof oldBlock === 'string'
+        ? { type: 'melody', content: newContentStr }
+        : { ...oldBlock, content: newContentStr };
+
+      return newBlocks;
+    });
+  };
+
+  const [blocks, setBlocks] = useState([{ type: 'melody', content: "1 2 3 1' 5," }]);
   const [parsedBlocks, setParsedBlocks] = useState([]);
   const svgRefs = useRef([]); // Array of refs for multiple SVGs
 
@@ -33,6 +282,21 @@ function App() {
   const [library, setLibrary] = useState([]);
   const [isSaving, setIsSaving] = useState(false);
   const [dbError, setDbError] = useState(null);
+
+  // Settings
+  const [selectedKeyIndex, setSelectedKeyIndex] = useState(0);
+  const selectedKeyRef = useRef(0); // Ref for audio loop access
+
+  // Sync Ref with State
+  useEffect(() => {
+    selectedKeyRef.current = selectedKeyIndex;
+  }, [selectedKeyIndex]);
+
+  const [isDark, setIsDark] = useState(true);
+
+  // Visual Settings
+  const [horizSpacing, setHorizSpacing] = useState(40);
+  const [vertScale, setVertScale] = useState(20);
 
   // User Identity (Simple LocalStorage UUID)
   const [userId, setUserId] = useState(null);
@@ -86,10 +350,18 @@ function App() {
       }
 
       if (existingId) {
-        if (confirm(`Overwrite existing "${title}" in "${album || 'Uncategorized'}"?`)) {
+        if (confirm(`Overwrite existing "${title}" in "${album || 'Uncategorized'}" ? `)) {
+          const saveData = {
+            blocks: blocks,
+            settings: {
+              kerning,
+              verticalScale
+            }
+          };
+
           await turso.execute({
             sql: "UPDATE melodies SET content = ?, key_index = ?, bpm = ? WHERE id = ?",
-            args: [JSON.stringify(blocks), selectedKeyIndex, bpm, existingId]
+            args: [JSON.stringify(saveData), selectedKeyIndex, bpm, existingId]
           });
           alert("Melody updated!");
         } else {
@@ -97,9 +369,17 @@ function App() {
           return;
         }
       } else {
+        const saveData = {
+          blocks: blocks,
+          settings: {
+            kerning,
+            verticalScale
+          }
+        };
+
         await turso.execute({
           sql: "INSERT INTO melodies (title, album, content, key_index, bpm, owner_id) VALUES (?, ?, ?, ?, ?, ?)",
-          args: [title, album, JSON.stringify(blocks), selectedKeyIndex, bpm, userId]
+          args: [title, album, JSON.stringify(saveData), selectedKeyIndex, bpm, userId]
         });
         alert("Melody saved!");
       }
@@ -119,7 +399,7 @@ function App() {
 
   const deleteMelody = async (e, item) => {
     e.stopPropagation(); // Prevent loading when clicking delete
-    if (!confirm(`Are you sure you want to delete "${item.title}"?`)) return;
+    if (!confirm(`Are you sure you want to delete "${item.title}" ? `)) return;
 
     try {
       await turso.execute({
@@ -134,21 +414,36 @@ function App() {
   };
 
   const loadMelody = (item) => {
-    if (confirm(`Load "${item.title}"? Unsaved changes will be lost.`)) {
+    if (confirm(`Load "${item.title}" ? Unsaved changes will be lost.`)) {
       setTitle(item.title);
       setAlbum(item.album || "");
 
       try {
         const loadedContent = JSON.parse(item.content);
         if (Array.isArray(loadedContent)) {
-          setBlocks(loadedContent);
+          // Legacy Format V1: just an array of strings
+          setBlocks(loadedContent.map(s => ({ type: 'melody', content: s })));
+          // Keep current settings or reset to defaults? 
+          // Requirement implies only saved songs have settings.
+        } else if (loadedContent && loadedContent.blocks) {
+          // New Format: { blocks, settings }
+          // Blocks can be strings (V2) or objects (V3)
+          const normalizedBlocks = loadedContent.blocks.map(b =>
+            typeof b === 'string' ? { type: 'melody', content: b } : b
+          );
+          setBlocks(normalizedBlocks);
+
+          if (loadedContent.settings) {
+            if (loadedContent.settings.kerning) setKerning(loadedContent.settings.kerning);
+            if (loadedContent.settings.verticalScale) setVerticalScale(loadedContent.settings.verticalScale);
+          }
         } else {
-          // Fallback for legacy single-string data
-          setBlocks([item.content]);
+          // Fallback
+          setBlocks([{ type: 'melody', content: item.content }]);
         }
       } catch (e) {
-        // Fallback if parsing fails
-        setBlocks([item.content]);
+        // Fallback
+        setBlocks([{ type: 'melody', content: item.content }]);
       }
 
       setSelectedKeyIndex(item.key_index || 0);
@@ -158,12 +453,12 @@ function App() {
 
   const updateBlock = (index, value) => {
     const newBlocks = [...blocks];
-    newBlocks[index] = value;
+    newBlocks[index] = { ...newBlocks[index], content: value };
     setBlocks(newBlocks);
   };
 
-  const addBlock = () => {
-    setBlocks([...blocks, ""]);
+  const addBlock = (type = 'melody') => {
+    setBlocks([...blocks, { type, content: "" }]);
   };
 
   const removeBlock = (index) => {
@@ -258,7 +553,13 @@ function App() {
           pitchIndex,
           midiVal: finalMidi,
           duration: duration,
-          originalText: token
+          originalText: token,
+          // Metadata for visual rendering
+          elementMetadata: {
+            underscoreCount,
+            dotCount,
+            dashCount
+          }
         });
         i++;
       } else {
@@ -274,6 +575,33 @@ function App() {
       .trim()
       .replace(/[^a-zA-Z0-9\s-_]/g, "") // Remove special chars
       .replace(/\s+/g, "_"); // Replace spaces with underscores
+  };
+
+  const handleFileImport = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const { jianpu, keyIndex, error } = parseMusicXML(text, forceKeyImport ? selectedKeyIndex : null);
+
+      if (error) {
+        alert("Failed to parse XML: " + error);
+        return;
+      }
+
+      if (jianpu) {
+        // Add new block with imported content
+        setBlocks(prev => [...prev, { type: 'melody', content: jianpu }]);
+        // Update key if detected
+        if (keyIndex !== undefined) {
+          setSelectedKeyIndex(keyIndex);
+        }
+      }
+    } catch (err) {
+      console.error("Import error:", err);
+      alert("Error importing file");
+    }
   };
 
   const handleDownloadSection = (index) => {
@@ -303,35 +631,36 @@ function App() {
   };
 
   // Key Signature Logic
-  const SCALE_TYPES = [
-    { name: 'C Major', root: 'C', notes: ['C', 'D', 'E', 'F', 'G', 'A', 'B'] },
-    { name: 'G Major', root: 'G', notes: ['G', 'A', 'B', 'C', 'D', 'E', 'F#'] },
-    { name: 'D Major', root: 'D', notes: ['D', 'E', 'F#', 'G', 'A', 'B', 'C#'] },
-    { name: 'A Major', root: 'A', notes: ['A', 'B', 'C#', 'D', 'E', 'F#', 'G#'] },
-    { name: 'E Major', root: 'E', notes: ['E', 'F#', 'G#', 'A', 'B', 'C#', 'D#'] },
-    { name: 'B Major', root: 'B', notes: ['B', 'C#', 'D#', 'E', 'F#', 'G#', 'A#'] },
-    { name: 'F# Major', root: 'F#', notes: ['F#', 'G#', 'A#', 'B', 'C#', 'D#', 'E#'] },
-    { name: 'Db Major', root: 'Db', notes: ['Db', 'Eb', 'F', 'Gb', 'Ab', 'Bb', 'C'] },
-    { name: 'Ab Major', root: 'Ab', notes: ['Ab', 'Bb', 'C', 'Db', 'Eb', 'F', 'G'] },
-    { name: 'Eb Major', root: 'Eb', notes: ['Eb', 'F', 'G', 'Ab', 'Bb', 'C', 'D'] },
-    { name: 'Bb Major', root: 'Bb', notes: ['Bb', 'C', 'D', 'Eb', 'F', 'G', 'A'] },
-    { name: 'F Major', root: 'F', notes: ['F', 'G', 'A', 'Bb', 'C', 'D', 'E'] },
-    { name: 'Numbers Only', root: 'C', notes: ['1', '2', '3', '4', '5', '6', '7'] }
-  ];
-
-  const [selectedKeyIndex, setSelectedKeyIndex] = useState(0); // Default C Major
-
-  // Map scale degree (1-7) to semitone interval from C for MIDI calculation
-  const SEMITONE_OFFSETS = [0, 2, 4, 5, 7, 9, 11];
+  // selectedKeyIndex is defined above with Refs
 
   useEffect(() => {
-    const results = blocks.map(block => parseInput(block, selectedKeyIndex));
+    const results = blocks.map(block => {
+      // Normalize to object if still string (safety)
+      const type = block.type || 'melody';
+      const content = block.content !== undefined ? block.content : (typeof block === 'string' ? block : "");
+
+      if (type === 'chords') {
+        // Chords Parsing: Just Chars
+        // Splitting by character as requested ("just letters/characters")
+        return {
+          type: 'chords',
+          chars: content.split(''),
+          originalText: content
+        };
+      }
+
+      // Melody Parsing
+      const parsed = parseInput(content, selectedKeyIndex);
+      return { type: 'melody', ...parsed, originalText: content };
+    });
     setParsedBlocks(results);
   }, [blocks, selectedKeyIndex]);
 
   // Dimensions & Scaling
-  const [kerning, setKerning] = useState(40); // User adjustable spacing
-  const [verticalScale, setVerticalScale] = useState(20); // Scale for pitch height difference
+  const [kerning, setKerning] = useState(20); // User adjustable spacing
+
+  const [verticalScale, setVerticalScale] = useState(20);
+  const [forceKeyImport, setForceKeyImport] = useState(false); // Scale for pitch height difference
 
   const calculateCanvasSize = (notes) => {
     let width = 800;
@@ -500,33 +829,82 @@ function App() {
                 <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
                   Melody Sections
                 </label>
-                <button onClick={addBlock} className="text-xs bg-bg-secondary hover:bg-glass-border px-3 py-1 rounded border border-glass-border transition-colors">
-                  + Add Section
-                </button>
+                <div className="flex gap-2">
+                  <input
+                    type="file"
+                    accept=".xml,.musicxml"
+                    ref={fileInputRef}
+                    onChange={handleFileImport}
+                    className="hidden"
+                  />
+                  <button
+                    onClick={() => fileInputRef.current.click()}
+                    className="text-xs bg-bg-secondary hover:bg-glass-border px-3 py-1 rounded border border-glass-border transition-colors text-white"
+                  >
+                    Import XML
+                  </button>
+                  <label className="flex items-center gap-2 text-xs text-white cursor-pointer select-none bg-bg-secondary px-2 py-1 rounded border border-transparent hover:border-glass-border transition-colors">
+                    <input
+                      type="checkbox"
+                      checked={forceKeyImport}
+                      onChange={(e) => setForceKeyImport(e.target.checked)}
+                      className="accent-teal-500"
+                    />
+                    Force Selected Key
+                  </label>
+                  <button onClick={() => addBlock('melody')} className="text-xs bg-teal-600 hover:bg-teal-500 px-3 py-1 rounded transition-colors text-white font-semibold">
+                    + Melody
+                  </button>
+                  <button onClick={() => addBlock('chords')} className="text-xs bg-indigo-600 hover:bg-indigo-500 px-3 py-1 rounded transition-colors text-white font-semibold">
+                    + Chords
+                  </button>
+                </div>
               </div>
 
               {blocks.map((blockContent, index) => (
-                <div key={index} className="flex gap-2">
-                  <div className="flex-grow relative">
-                    <span className="absolute left-[-25px] top-3 text-text-muted text-xs font-mono">{index + 1}.</span>
-                    <input
-                      type="text"
-                      value={blockContent}
-                      onChange={(e) => updateBlock(index, e.target.value)}
-                      placeholder={`Section ${index + 1} notes...`}
-                      className="w-full font-mono text-lg bg-bg-secondary border border-glass-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-teal-500"
-                      spellCheck={false}
-                    />
-                  </div>
-                  {blocks.length > 1 && (
+                <div key={index} className="glass-panel p-4 rounded-xl border border-glass-border bg-base-100/30">
+                  <div className="flex justify-between items-center mb-2">
+                    <div className="flex items-center gap-2">
+                      <h3 className="font-semibold text-teal-400">
+                        Section {index + 1}
+                        <span className="text-xs text-text-muted ml-2 uppercase border border-glass-border px-1 rounded">
+                          {blockContent.type === 'chords' ? 'Chords' : 'Melody'}
+                        </span>
+                      </h3>
+                      {/* Per-Section Mic Button - Only for Melody */}
+                      {blockContent.type !== 'chords' && (
+                        <button
+                          onClick={() => toggleMic(index)}
+                          className={`flex items - center justify - center w - 8 h - 8 rounded - full transition - all shadow
+                            ${recordingBlockIndex === index
+                              ? 'bg-red-500 text-white animate-pulse'
+                              : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                            } `}
+                          title={recordingBlockIndex === index ? "Stop Recording" : "Record to this section"}
+                        >
+                          {recordingBlockIndex === index ? (
+                            <span className="text-xs">{detectedNoteLabel || "..."}</span>
+                          ) : (
+                            "🎤"
+                          )}
+                        </button>
+                      )}
+                    </div>
+
                     <button
                       onClick={() => removeBlock(index)}
-                      className="px-3 py-2 bg-red-900/30 text-red-400 hover:bg-red-900/50 rounded-lg border border-red-900/50 transition-colors"
-                      title="Remove Section"
+                      className="text-gray-500 hover:text-red-400 transition-colors text-sm"
                     >
-                      ✕
+                      Remove
                     </button>
-                  )}
+                  </div>
+
+                  <textarea
+                    value={blockContent.content || (typeof blockContent === 'string' ? blockContent : "")}
+                    onChange={(e) => updateBlock(index, e.target.value)}
+                    className="w-full h-24 bg-bg-primary p-3 rounded-lg border border-glass-border focus:border-teal-500 focus:outline-none font-mono text-lg resize-y mb-2"
+                    placeholder="Enter notes (e.g., 1 2 3)"
+                  />
                 </div>
               ))}
 
@@ -583,6 +961,60 @@ function App() {
           <div className="flex flex-col gap-4">
 
             {parsedBlocks.map((blockResult, bIndex) => {
+              if (blockResult.type === 'chords') {
+                // CHORDS RENDERING
+                // Simple width calculation: char count * kerning + padding
+                const width = Math.max(100, (blockResult.chars.length * kerning) + 40);
+                const height = 100; // Fixed height for chords
+
+                return (
+                  <div key={bIndex} className="rounded-xl overflow-hidden bg-white shadow-xl border-4 border-indigo-100 relative group">
+                    <div className="absolute top-2 left-2 text-indigo-400 text-xs font-bold uppercase tracking-widest pointer-events-none">
+                      Section {bIndex + 1} (Chords)
+                    </div>
+
+                    {/* Download Button (Appears on Hover) */}
+                    <button
+                      onClick={() => handleDownloadSection(bIndex)}
+                      className="absolute top-2 right-2 bg-gray-100 hover:bg-gray-200 text-gray-600 p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 z-10"
+                      title="Download SVG"
+                    >
+                      <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                      </svg>
+                    </button>
+
+                    <div className="overflow-x-auto">
+                      <div style={{ width: width, height: height }} className="relative mx-auto bg-white text-black">
+                        <svg
+                          ref={el => svgRefs.current[bIndex] = el}
+                          width={width}
+                          height={height}
+                          xmlns="http://www.w3.org/2000/svg"
+                          className="block"
+                        >
+                          {blockResult.chars.map((char, index) => (
+                            <text
+                              key={index}
+                              x={20 + (index * kerning)}
+                              y="60"
+                              textAnchor="middle"
+                              fill="#000000"
+                              fontWeight="bold"
+                              fontFamily="monospace"
+                              fontSize="24" // Larger for chords?
+                            >
+                              {char}
+                            </text>
+                          ))}
+                        </svg>
+                      </div>
+                    </div>
+                  </div>
+                );
+              }
+
+              // MELODY RENDERING
               const { width, height, baseY } = calculateCanvasSize(blockResult.notes);
               return (
                 <div key={bIndex} className="rounded-xl overflow-hidden bg-white shadow-xl border-4 border-white relative group">
@@ -616,7 +1048,7 @@ function App() {
                           xmlns="http://www.w3.org/2000/svg"
                           className="block"
                         >
-                          {blockResult.notes.filter(item => item.type === 'note').map((item, index) => {
+                          {blockResult.notes.filter(item => item.type === 'note').map((item, index, array) => {
                             const x = 20 + index * kerning;
                             const y = baseY - (item.pitchIndex * verticalScale);
                             const match = item.note.match(/^([A-Ga-g1-7])([#b]?)/);
@@ -624,10 +1056,62 @@ function App() {
                             let acc = '';
                             if (match) { base = match[1]; acc = match[2]; }
 
+                            // Check next note for beaming
+                            const nextItem = array[index + 1];
+                            let nextY = y;
+                            let nextX = x;
+                            if (nextItem) {
+                              nextY = baseY - (nextItem.pitchIndex * verticalScale);
+                              nextX = 20 + (index + 1) * kerning;
+                            }
+
                             return (
                               <g key={index}>
                                 <text x={x} y={y} dy="0.35em" textAnchor="middle" fill="#000000" fontWeight="500" fontFamily="sans-serif" fontSize="24">{base}</text>
                                 {acc && <text x={x + 10} y={y - 8} textAnchor="start" fill="#000000" fontWeight="bold" fontFamily="sans-serif" fontSize="14">{acc}</text>}
+
+                                {/* Dotted Note Indicator */}
+                                {item.elementMetadata?.dotCount > 0 && (
+                                  <circle cx={x + 14} cy={y} r={2.5} fill="#000000" />
+                                )}
+
+                                {/* Duration Dashes (for half/whole notes) */}
+                                {item.elementMetadata?.dashCount > 0 && Array.from({ length: item.elementMetadata.dashCount }).map((_, i) => (
+                                  <text
+                                    key={`dash-${i}`}
+                                    x={x + 24 + (i * 20)}
+                                    y={y}
+                                    dy="0.35em"
+                                    textAnchor="middle"
+                                    fill="#000000"
+                                    fontWeight="normal"
+                                    fontFamily="sans-serif"
+                                    fontSize="24"
+                                  >
+                                    -
+                                  </text>
+                                ))}
+
+                                {/* Duration Underlines (Beams) */}
+                                {/* Level 1 (8th notes) */}
+                                {item.elementMetadata?.underscoreCount >= 1 && (
+                                  <>
+                                    <line x1={x - 8} y1={y + 14} x2={x + 8} y2={y + 14} stroke="#000000" strokeWidth="2" />
+                                    {nextItem?.elementMetadata?.underscoreCount >= 1 && (
+                                      <line x1={x + 8} y1={y + 14} x2={nextX - 8} y2={nextY + 14} stroke="#000000" strokeWidth="2" />
+                                    )}
+                                  </>
+                                )}
+
+                                {/* Level 2 (16th notes) */}
+                                {item.elementMetadata?.underscoreCount >= 2 && (
+                                  <>
+                                    <line x1={x - 8} y1={y + 20} x2={x + 8} y2={y + 20} stroke="#000000" strokeWidth="2" />
+                                    {nextItem?.elementMetadata?.underscoreCount >= 2 && (
+                                      <line x1={x + 8} y1={y + 20} x2={nextX - 8} y2={nextY + 20} stroke="#000000" strokeWidth="2" />
+                                    )}
+                                  </>
+                                )}
                               </g>
                             );
                           })}
@@ -646,10 +1130,11 @@ function App() {
               <button
                 onClick={playMelody}
                 disabled={isPlaying}
-                className={`flex items-center gap-2 px-6 py-2 rounded-lg font-semibold transition-all shadow-lg w-full md:w-auto justify-center
+                className={`flex items - center gap - 2 px - 6 py - 2 rounded - lg font - semibold transition - all shadow - lg w - full md: w - auto justify - center
                   ${isPlaying
-                    ? 'bg-gray-700 text-gray-400 cursor-not-allowed'
-                    : 'bg-gradient-to-r from-teal-500 to-teal-700 text-white hover:translate-y-[-2px] hover:shadow-cyan-500/20'}`}
+                    ? 'bg-red-500 text-white animate-pulse'
+                    : 'bg-teal-500 text-bg-primary hover:bg-teal-400'
+                  } `}
               >
                 <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
                   {isPlaying ? (
