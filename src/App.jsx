@@ -4,6 +4,7 @@ import * as Tone from 'tone';
 import { PitchDetector } from 'pitchy';
 import { turso } from './tursoClient';
 import { parseMusicXML } from './MusicXMLParser';
+import { parseMidi } from './MidiParser';
 
 const NOTE_MAP = {
   1: 'C',
@@ -582,11 +583,20 @@ function App() {
     if (!file) return;
 
     try {
-      const text = await file.text();
-      const { jianpu, keyIndex, error } = parseMusicXML(text, forceKeyImport ? selectedKeyIndex : null);
+      let result = {};
+
+      if (file.name.endsWith('.mid') || file.name.endsWith('.midi')) {
+        const buffer = await file.arrayBuffer();
+        result = await parseMidi(buffer, forceKeyImport ? selectedKeyIndex : null);
+      } else {
+        const text = await file.text();
+        result = parseMusicXML(text, forceKeyImport ? selectedKeyIndex : null);
+      }
+
+      const { jianpu, keyIndex, error } = result;
 
       if (error) {
-        alert("Failed to parse XML: " + error);
+        alert("Failed to parse file: " + error);
         return;
       }
 
@@ -832,7 +842,7 @@ function App() {
                 <div className="flex gap-2">
                   <input
                     type="file"
-                    accept=".xml,.musicxml"
+                    accept=".xml,.musicxml,.mid,.midi"
                     ref={fileInputRef}
                     onChange={handleFileImport}
                     className="hidden"
@@ -841,7 +851,7 @@ function App() {
                     onClick={() => fileInputRef.current.click()}
                     className="text-xs bg-bg-secondary hover:bg-glass-border px-3 py-1 rounded border border-glass-border transition-colors text-white"
                   >
-                    Import XML
+                    Import XML/MIDI
                   </button>
                   <label className="flex items-center gap-2 text-xs text-white cursor-pointer select-none bg-bg-secondary px-2 py-1 rounded border border-transparent hover:border-glass-border transition-colors">
                     <input

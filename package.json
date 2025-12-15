@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@libsql/client": "^0.15.15",
+    "@tonejs/midi": "^2.0.28",
     "pitchy": "^4.1.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
