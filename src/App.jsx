@@ -1,10 +1,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import * as Tone from 'tone';
-import { PitchDetector } from 'pitchy';
 import { turso } from './tursoClient';
-import { parseMusicXML } from './MusicXMLParser';
-import { parseMidi } from './MidiParser';
 
 const NOTE_MAP = {
   1: 'C',
@@ -45,237 +42,21 @@ const SCALE_TYPES = [
 ];
 
 function App() {
-  // --- Audio Transcription State ---
-  const [recordingBlockIndex, setRecordingBlockIndex] = useState(null); // replaces isMicActive
-  const recordingBlockRef = useRef(null); // Ref to avoid stale closures in loop
-
-  const [detectedNoteLabel, setDetectedNoteLabel] = useState("");
-  const audioContextRef = useRef(null);
-  const analyserRef = useRef(null);
-  const streamRef = useRef(null);
-  const fileInputRef = useRef(null);
-  const detectorRef = useRef(null);
-  const inputBufferRef = useRef(null);
-  const lastNoteRef = useRef({ midi: null, firstSeen: 0 });
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      stopMic();
-    };
-  }, []);
 
 
-  const playReferenceChords = async () => {
-    // Force Key to C Major (Index 0 in SCALE_TYPES)
-    setSelectedKeyIndex(0);
-    setDetectedNoteLabel("Playing Reference...");
 
-    await Tone.start();
-    const synth = new Tone.PolySynth(Tone.Synth).toDestination();
-    synth.volume.value = -10;
 
-    const now = Tone.now();
-    // Chord C: C4, E4, G4
-    synth.triggerAttackRelease(["C4", "E4", "G4"], "0.8", now);
-    // Chord F: F4, A4, C5
-    synth.triggerAttackRelease(["F4", "A4", "C5"], "0.8", now + 1);
-    // Chord C: C4, E4, G4
-    synth.triggerAttackRelease(["C4", "E4", "G4"], "1.5", now + 2);
 
-    // Wait for playback to finish (3 seconds) before resolving
-    return new Promise(resolve => setTimeout(resolve, 3200));
-  };
 
-  const toggleMic = async (index) => {
-    // Stop if active
-    if (recordingBlockRef.current !== null) {
-      const wasSameIndex = recordingBlockRef.current === index;
-      stopMic();
-      if (wasSameIndex) return; // Toggle OFF behavior
-    }
-
-    // Start Recording sequence
-    setRecordingBlockIndex(index);
-    recordingBlockRef.current = index; // Sync Ref
-
-    try {
-      // 1. Play Reference Chords (C -> F -> C)
-      await playReferenceChords();
-
-      // Check if user cancelled during playback
-      if (recordingBlockRef.current !== index) return;
-
-      // 2. Start Input
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      audioContextRef.current = audioContext;
-
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 2048;
-      analyserRef.current = analyser;
-
-      const source = audioContext.createMediaStreamSource(stream);
-      source.connect(analyser);
-
-      // Pitchy Setup
-      detectorRef.current = PitchDetector.forFloat32Array(analyser.fftSize);
-      inputBufferRef.current = new Float32Array(detectorRef.current.inputLength);
-
-      setDetectedNoteLabel("Listening...");
-      detectPitchLoop();
-
-    } catch (err) {
-      console.error("Mic Error:", err);
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        alert("Permission Denied: Please allow microphone access in your browser settings.");
-      } else {
-        alert("Microphone Error: " + err.message);
-      }
-      stopMic();
-    }
-  };
-
-  const stopMic = () => {
-    setRecordingBlockIndex(null);
-    recordingBlockRef.current = null; // Sync Ref
-    setDetectedNoteLabel("");
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-    analyserRef.current = null;
-    detectorRef.current = null;
-  };
-
-  const detectPitchLoop = () => {
-    if (!analyserRef.current || !detectorRef.current) return;
-    if (!streamRef.current || !streamRef.current.active) return;
-
-    const analyser = analyserRef.current;
-    const detector = detectorRef.current;
-    const buffer = inputBufferRef.current;
-
-    analyser.getFloatTimeDomainData(buffer);
-
-    // Pitchy: findPitch(buffer, sampleRate) -> [pitch, clarity]
-    const [pitch, clarity] = detector.findPitch(buffer, audioContextRef.current.sampleRate);
-
-    if (clarity > 0.8 && pitch > 60 && pitch < 2000) { // Thresholds: Clarity > 80%, Hz range
-      processDetectedPitch(pitch);
-    } else {
-      lastNoteRef.current = { midi: null, firstSeen: 0 };
-      // Keep label if just transient noise, or clear?
-      // setDetectedNoteLabel("..."); 
-    }
-
-    requestAnimationFrame(() => detectPitchLoop());
-  };
-
-  const processDetectedPitch = (frequency) => {
-    // 1. Hz -> MIDI
-    const midiNum = Math.round(69 + 12 * Math.log2(frequency / 440));
-    const noteName = Tone.Frequency(midiNum, "midi").toNote();
-
-    // Debug Log (throttled/occasional would be better, but explicit is good now)
-    // console.log("Pitch:", noteName, midiNum); 
-
-    setDetectedNoteLabel(noteName);
-
-    // 2. Stability Check
-    const now = Date.now();
-    if (lastNoteRef.current.midi === midiNum) {
-      if (now - lastNoteRef.current.firstSeen > 300) {
-        addNoteFromMidi(midiNum);
-        lastNoteRef.current = { midi: null, firstSeen: now + 500 };
-      }
-    } else {
-      lastNoteRef.current = { midi: midiNum, firstSeen: now };
-    }
-  };
-
-  const addNoteFromMidi = (midi) => {
-    // Guards
-    // Check Ref ensures we have latest value in closure
-    if (recordingBlockRef.current === null) return;
-
-    // Quantize MIDI to Scale Degree (1-7)
-    // Use selectedKeyIndex to identify Root
-    // This is the hard part: Map absolute MIDI to relative Jianpu '1 2 3'
-
-    // Use REF for key index to avoid stale closure
-    const currentScale = SCALE_TYPES[selectedKeyRef.current];
-    const rootNote = currentScale.root;
-
-    // Debug
-    console.log(`Detected: ${midi}, Key: ${rootNote}, Block: ${recordingBlockRef.current}`);
-
-    if (currentScale.name === 'Numbers Only') return;
-
-    const rootMidi = Tone.Frequency(rootNote + "4").toMidi();
-
-    // Calculate semitone difference from Root
-    // We need to normalize octaves.
-    // e.g. Key=G(67). Sung=G4(67) -> 1. Sung=G5(79) -> 1'.
-
-    let relativeSemitones = midi - rootMidi;
-
-    // Calculate Octave Shift
-    let octave = Math.floor(relativeSemitones / 12);
-    let semitoneInScale = ((relativeSemitones % 12) + 12) % 12; // 0-11 positive
-
-    // Map semitoneInScale to Degree (1-7)
-    // Major Scale Intervals: 0, 2, 4, 5, 7, 9, 11
-    const INTERVAL_Map = {
-      0: '1', 2: '2', 4: '3', 5: '4', 7: '5', 9: '6', 11: '7'
-    };
-
-    // If sung pitch is not in scale (e.g. 1#), ignore or map to nearest?
-    // MVP: Only accept diatonic notes.
-    let degree = INTERVAL_Map[semitoneInScale];
-    if (!degree) {
-      console.log("Ignored chromatic:", semitoneInScale);
-      return;
-    }
-
-    // Format String
-    let noteStr = degree;
-    if (octave > 0) noteStr += "'".repeat(octave);
-    if (octave < 0) noteStr += ",".repeat(Math.abs(octave));
-
-    console.log("Adding Note String:", noteStr);
-
-    // Append to the SPECIFIC block being recorded
-    setBlocks(prev => {
-      const newBlocks = [...prev];
-      // Use Ref for correct index
-      const idx = recordingBlockRef.current;
-      if (idx === null || idx >= newBlocks.length) return prev;
-
-      const oldBlock = newBlocks[idx];
-      // Check if it's a melody block before adding notes
-      // We assume recording is only for melody sections for now
-      const contentStr = typeof oldBlock === 'string' ? oldBlock : (oldBlock.content || '');
-
-      const newContentStr = (contentStr + " " + noteStr).trim();
-
-      newBlocks[idx] = typeof oldBlock === 'string'
-        ? { type: 'melody', content: newContentStr }
-        : { ...oldBlock, content: newContentStr };
-
-      return newBlocks;
-    });
-  };
 
   const [blocks, setBlocks] = useState([{ type: 'melody', content: "1 2 3 1' 5," }]);
   const [parsedBlocks, setParsedBlocks] = useState([]);
+  const [playOnlySelected, setPlayOnlySelected] = useState(false);
+  const [isLooping, setIsLooping] = useState(false);
+  const [selectionInfo, setSelectionInfo] = useState({ blockIndex: null, text: "" });
   const svgRefs = useRef([]); // Array of refs for multiple SVGs
+  const synthRef = useRef(null);
+  const filterRef = useRef(null);
 
   // Persistence State
   const [title, setTitle] = useState("Untitled Melody");
@@ -286,18 +67,17 @@ function App() {
 
   // Settings
   const [selectedKeyIndex, setSelectedKeyIndex] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [bpm, setBpm] = useState(100); // Default 100 BPM
   const selectedKeyRef = useRef(0); // Ref for audio loop access
 
-  // Sync Ref with State
+  // Sync Ref with State and Tone Transport
   useEffect(() => {
     selectedKeyRef.current = selectedKeyIndex;
-  }, [selectedKeyIndex]);
+    Tone.Transport.bpm.value = bpm;
+  }, [selectedKeyIndex, bpm]);
 
-  const [isDark, setIsDark] = useState(true);
 
-  // Visual Settings
-  const [horizSpacing, setHorizSpacing] = useState(40);
-  const [vertScale, setVertScale] = useState(20);
 
   // User Identity (Simple LocalStorage UUID)
   const [userId, setUserId] = useState(null);
@@ -479,14 +259,14 @@ function App() {
     // 1. Bar lines/Repeat signs: :|: or |: or :| or ||| or || or |
     // 2. Structure blocks: [ ... ]
     // 3. Notes with modifiers: [1-7] followed by any combination of [b#n '", . _ = -]*
-    const tokens = str.match(/([\|:]+|\[[^\]]+\]|[1-7][b#n'\",\._=\-]*)/g) || [];
+    const tokens = str.match(/([|:]+|\[[^\]]+\]|[1-7][b#n'\",._=-]*)/g) || [];
 
     let i = 0;
     while (i < tokens.length) {
       const token = tokens[i];
 
       // -- CASE 1: Bar Line or Structure --
-      if (/^[\|:\[]/.test(token)) {
+      if (/^[|:[]/.test(token)) {
         parsed.push({
           type: 'bar',
           text: token
@@ -549,6 +329,7 @@ function App() {
 
         parsed.push({
           type: 'note',
+          digit: noteChar, // Store the actual number (1-7)
           note: visualLabel,
           octave,
           pitchIndex,
@@ -578,41 +359,7 @@ function App() {
       .replace(/\s+/g, "_"); // Replace spaces with underscores
   };
 
-  const handleFileImport = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
 
-    try {
-      let result = {};
-
-      if (file.name.endsWith('.mid') || file.name.endsWith('.midi')) {
-        const buffer = await file.arrayBuffer();
-        result = await parseMidi(buffer, forceKeyImport ? selectedKeyIndex : null);
-      } else {
-        const text = await file.text();
-        result = parseMusicXML(text, forceKeyImport ? selectedKeyIndex : null);
-      }
-
-      const { jianpu, keyIndex, error } = result;
-
-      if (error) {
-        alert("Failed to parse file: " + error);
-        return;
-      }
-
-      if (jianpu) {
-        // Add new block with imported content
-        setBlocks(prev => [...prev, { type: 'melody', content: jianpu }]);
-        // Update key if detected
-        if (keyIndex !== undefined) {
-          setSelectedKeyIndex(keyIndex);
-        }
-      }
-    } catch (err) {
-      console.error("Import error:", err);
-      alert("Error importing file");
-    }
-  };
 
   const handleDownloadSection = (index) => {
     const svgEl = svgRefs.current[index];
@@ -670,7 +417,6 @@ function App() {
   const [kerning, setKerning] = useState(20); // User adjustable spacing
 
   const [verticalScale, setVerticalScale] = useState(20);
-  const [forceKeyImport, setForceKeyImport] = useState(false); // Scale for pitch height difference
 
   const calculateCanvasSize = (notes) => {
     let width = 800;
@@ -696,14 +442,33 @@ function App() {
   };
 
   // Audio Playback
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [bpm, setBpm] = useState(100); // Default 100 BPM
+
+  const stopMelody = () => {
+    Tone.Transport.stop();
+    Tone.Transport.cancel();
+    Tone.Transport.loop = false;
+    if (synthRef.current) {
+      synthRef.current.releaseAll();
+      synthRef.current.dispose();
+      synthRef.current = null;
+    }
+    if (filterRef.current) {
+      filterRef.current.dispose();
+      filterRef.current = null;
+    }
+    setIsPlaying(false);
+  };
 
   const playMelody = async () => {
-    if (isPlaying) return;
+    if (isPlaying) {
+      stopMelody();
+      return;
+    }
     setIsPlaying(true);
 
     await Tone.start();
+    Tone.Transport.cancel(); // Clear any existing events
+    Tone.Transport.bpm.value = bpm;
 
     const synth = new Tone.PolySynth(Tone.Synth, {
       oscillator: { type: "triangle" },
@@ -719,456 +484,427 @@ function App() {
     const filter = new Tone.Filter(800, "lowpass").toDestination();
     synth.connect(filter);
 
-    const now = Tone.now();
-    const secondsPerBeat = 60 / bpm;
-    let globalTimeOffset = 0;
+    synthRef.current = synth;
+    filterRef.current = filter;
 
-    // Sequential Playback
-    parsedBlocks.forEach((blockResult) => {
-      let blockTimeOffset = 0;
+    let blocksToPlay = parsedBlocks;
 
-      blockResult.notes.forEach((note) => {
+    if (playOnlySelected) {
+      if (selectionInfo.text?.trim()) {
+        const temp = parseInput(selectionInfo.text, selectedKeyIndex);
+        blocksToPlay = [{ type: 'melody', ...temp, originalText: selectionInfo.text }];
+      } else if (selectionInfo.blockIndex !== null && parsedBlocks[selectionInfo.blockIndex]) {
+        blocksToPlay = [parsedBlocks[selectionInfo.blockIndex]];
+      } else {
+        setIsPlaying(false);
+        return;
+      }
+    }
+
+    let currentTicks = 0;
+
+    // Sequential Playback using Transport
+    blocksToPlay.forEach((blockResult) => {
+      blockResult.notes?.forEach((note) => {
         if (note.type !== 'note') return;
 
         const frequency = Tone.Frequency(note.midiVal, "midi").toFrequency();
-        const durationSeconds = note.duration * secondsPerBeat;
-        synth.triggerAttackRelease(frequency, durationSeconds * 0.9, now + globalTimeOffset + blockTimeOffset);
-        blockTimeOffset += durationSeconds;
-      });
+        const startTicks = currentTicks;
+        const durationTicks = note.duration * Tone.Transport.PPQ; // PPQ is ticks per quarter note
 
-      // Add this block's total duration to the global offset so next block starts after
-      globalTimeOffset += blockResult.totalDuration * secondsPerBeat;
+        Tone.Transport.schedule((time) => {
+          // Calculate duration in seconds at trigger time for accurate release
+          const secondsPerBeat = 60 / Tone.Transport.bpm.value;
+          const durationSeconds = note.duration * secondsPerBeat;
+          synth.triggerAttackRelease(frequency, durationSeconds * 0.9, time);
+        }, Tone.Ticks(startTicks));
+
+        currentTicks += durationTicks;
+      });
     });
 
-    setTimeout(() => {
-      setIsPlaying(false);
-      synth.dispose();
-      filter.dispose();
-    }, globalTimeOffset * 1000 + 500); // Buffer
+    // Schedule stop at the end or loop
+    if (isLooping) {
+      Tone.Transport.loop = true;
+      Tone.Transport.loopStart = 0;
+      Tone.Transport.loopEnd = Tone.Ticks(currentTicks + Tone.Transport.PPQ);
+    } else {
+      Tone.Transport.schedule((time) => {
+        Tone.Draw.schedule(() => {
+          stopMelody();
+        }, time);
+      }, Tone.Ticks(currentTicks + Tone.Transport.PPQ));
+    }
+
+    Tone.Transport.start();
   };
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center p-4 md:p-8">
+    <div className="h-screen flex flex-col overflow-hidden bg-bg-primary font-sans">
 
       {/* Header */}
-      <header className="mb-6 text-center">
-        <h1 className="text-4xl font-bold text-teal-400 mb-2">
-          Jianpu Visualizer
-        </h1>
-        <p className="text-text-muted">
-          Design, Listen, and Save your Melodies
-        </p>
+      <header className="flex-shrink-0 bg-bg-secondary border-b border-glass-border p-4 flex justify-between items-center z-20">
+        <div>
+          <h1 className="text-2xl font-bold text-teal-400">Jianpu Visualizer</h1>
+          <p className="text-[10px] text-text-muted uppercase tracking-[0.2em]">Design, Listen, and Save</p>
+        </div>
+        <div className="flex items-center gap-4">
+          <div className="flex flex-col items-end">
+            <span className="text-[10px] text-teal-400 font-bold uppercase tracking-widest">{title}</span>
+            <span className="text-[9px] text-text-muted">{album || 'Uncategorized'}</span>
+          </div>
+        </div>
       </header>
 
-      <div className="flex flex-col lg:flex-row gap-6 w-full max-w-7xl">
+      <div className="flex-1 flex overflow-hidden w-full max-w-[100vw]">
 
         {/* Library Sidebar */}
-        <div className="w-full lg:w-64 flex-shrink-0 bg-bg-secondary border border-glass-border rounded-xl p-4 flex flex-col gap-4 max-h-[80vh] overflow-y-auto">
-          <h2 className="text-xl font-bold text-white mb-2 sticky top-0 bg-bg-secondary py-2 border-b border-glass-border">
-            Library
-          </h2>
-          {dbError && <div className="text-red-400 text-xs">{dbError}</div>}
-          {library.length === 0 && !dbError && (
-            <div className="text-text-muted text-sm italic">No saved melodies yet.</div>
-          )}
-          {library.map((item) => (
-            <div
-              key={item.id}
-              onClick={() => loadMelody(item)}
-              className="p-3 rounded-lg bg-bg-primary hover:bg-glass-surface cursor-pointer transition-colors border border-transparent hover:border-teal-500 group relative"
-            >
-              <div className="font-bold text-white text-sm group-hover:text-teal-400 truncate pr-6">{item.title}</div>
-              {item.album && <div className="text-xs text-text-muted truncate pr-6">{item.album}</div>}
-              <div className="text-[10px] text-gray-500 mt-1">{new Date(item.created_at).toLocaleDateString()}</div>
+        <div className="w-64 flex-shrink-0 bg-bg-secondary/50 border-r border-glass-border flex flex-col overflow-hidden">
+          <div className="p-4 border-b border-glass-border">
+            <h2 className="text-xs font-bold text-teal-400 uppercase tracking-widest">Library</h2>
+          </div>
+          <div className="flex-1 overflow-y-auto custom-scrollbar p-3 flex flex-col gap-2">
+            {dbError && <div className="text-red-400 text-xs">{dbError}</div>}
+            {library.length === 0 && !dbError && (
+              <div className="text-text-muted text-sm italic">No saved melodies yet.</div>
+            )}
+            {library.map((item) => (
+              <div
+                key={item.id}
+                onClick={() => loadMelody(item)}
+                className="p-3 rounded-lg bg-bg-primary hover:bg-glass-surface cursor-pointer transition-colors border border-transparent hover:border-teal-500 group relative"
+              >
+                <div className="font-bold text-white text-sm group-hover:text-teal-400 truncate pr-6">{item.title}</div>
+                {item.album && <div className="text-xs text-text-muted truncate pr-6">{item.album}</div>}
+                <div className="text-[10px] text-gray-500 mt-1">{new Date(item.created_at).toLocaleDateString()}</div>
 
-              {/* Delete Button (Only if Owner) */}
-              {item.owner_id === userId && (
-                <button
-                  onClick={(e) => deleteMelody(e, item)}
-                  className="absolute top-2 right-2 text-gray-600 hover:text-red-500 transition-colors bg-base-100/50 rounded p-1"
-                  title="Delete"
-                >
-                  <svg width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
-                  </svg>
-                </button>
-              )}
-            </div>
-          ))}
+                {/* Delete Button (Only if Owner) */}
+                {item.owner_id === userId && (
+                  <button
+                    onClick={(e) => deleteMelody(e, item)}
+                    className="absolute top-2 right-2 text-gray-600 hover:text-red-500 transition-colors bg-base-100/50 rounded p-1"
+                    title="Delete"
+                  >
+                    <svg width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                    </svg>
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
 
         {/* Main Editor Panel */}
-        <div className="glass-panel flex-1 p-6 flex flex-col gap-6">
+        <div className="flex-1 flex flex-col overflow-hidden bg-bg-primary">
+          <div className="flex-1 overflow-y-auto custom-scrollbar p-6">
+            <div className="max-w-6xl mx-auto flex flex-col gap-6">
 
-          {/* Metadata Inputs */}
-          <div className="flex flex-col md:flex-row gap-4 border-b border-glass-border pb-6">
-            <div className="flex-1">
-              <label className="text-teal-400 font-semibold text-xs uppercase tracking-wider block mb-1">Title</label>
-              <input
-                className="w-full bg-bg-secondary border border-glass-border rounded px-3 py-2 text-white focus:border-teal-500 outline-none"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="Song Title"
-              />
-            </div>
-            <div className="flex-1">
-              <label className="text-teal-400 font-semibold text-xs uppercase tracking-wider block mb-1">Album / Collection</label>
-              <input
-                className="w-full bg-bg-secondary border border-glass-border rounded px-3 py-2 text-white focus:border-teal-500 outline-none"
-                value={album}
-                onChange={(e) => setAlbum(e.target.value)}
-                placeholder="Album Name"
-              />
-            </div>
-            <div className="flex items-end">
-              <button
-                onClick={saveMelody}
-                disabled={isSaving}
-                className="bg-teal-500 hover:bg-opacity-80 text-black font-bold py-2 px-6 rounded-lg transition-all h-[42px] whitespace-nowrap"
-              >
-                {isSaving ? 'Saving...' : 'Save to Cloud'}
-              </button>
-            </div>
-          </div>
-
-          {/* Controls & Input */}
-          <div className="flex flex-col gap-6">
-
-            <div className="flex flex-col gap-6">
-              <div className="flex justify-between items-center">
-                <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
-                  Melody Sections
-                </label>
-                <div className="flex gap-2">
+              {/* Metadata Inputs */}
+              <div className="flex flex-col md:flex-row gap-4 bg-bg-secondary/30 p-4 rounded-xl border border-glass-border">
+                <div className="flex-1">
+                  <label className="text-teal-400 font-semibold text-[10px] uppercase tracking-wider block mb-1">Title</label>
                   <input
-                    type="file"
-                    accept=".xml,.musicxml,.mid,.midi"
-                    ref={fileInputRef}
-                    onChange={handleFileImport}
-                    className="hidden"
+                    className="w-full bg-bg-secondary border border-glass-border rounded px-3 py-2 text-white focus:border-teal-500 outline-none text-sm"
+                    value={title}
+                    onChange={(e) => setTitle(e.target.value)}
+                    placeholder="Song Title"
                   />
+                </div>
+                <div className="flex-1">
+                  <label className="text-teal-400 font-semibold text-[10px] uppercase tracking-wider block mb-1">Album / Collection</label>
+                  <input
+                    className="w-full bg-bg-secondary border border-glass-border rounded px-3 py-2 text-white focus:border-teal-500 outline-none text-sm"
+                    value={album}
+                    onChange={(e) => setAlbum(e.target.value)}
+                    placeholder="Album Name"
+                  />
+                </div>
+                <div className="flex items-end">
                   <button
-                    onClick={() => fileInputRef.current.click()}
-                    className="text-xs bg-bg-secondary hover:bg-glass-border px-3 py-1 rounded border border-glass-border transition-colors text-white"
+                    onClick={saveMelody}
+                    disabled={isSaving}
+                    className="bg-teal-500 hover:bg-opacity-80 text-black font-bold py-2 px-6 rounded-lg transition-all h-[38px] text-xs whitespace-nowrap"
                   >
-                    Import XML/MIDI
-                  </button>
-                  <label className="flex items-center gap-2 text-xs text-white cursor-pointer select-none bg-bg-secondary px-2 py-1 rounded border border-transparent hover:border-glass-border transition-colors">
-                    <input
-                      type="checkbox"
-                      checked={forceKeyImport}
-                      onChange={(e) => setForceKeyImport(e.target.checked)}
-                      className="accent-teal-500"
-                    />
-                    Force Selected Key
-                  </label>
-                  <button onClick={() => addBlock('melody')} className="text-xs bg-teal-600 hover:bg-teal-500 px-3 py-1 rounded transition-colors text-white font-semibold">
-                    + Melody
-                  </button>
-                  <button onClick={() => addBlock('chords')} className="text-xs bg-indigo-600 hover:bg-indigo-500 px-3 py-1 rounded transition-colors text-white font-semibold">
-                    + Chords
+                    {isSaving ? 'Saving...' : 'Save to Cloud'}
                   </button>
                 </div>
               </div>
 
-              {blocks.map((blockContent, index) => (
-                <div key={index} className="glass-panel p-4 rounded-xl border border-glass-border bg-base-100/30">
-                  <div className="flex justify-between items-center mb-2">
-                    <div className="flex items-center gap-2">
-                      <h3 className="font-semibold text-teal-400">
-                        Section {index + 1}
-                        <span className="text-xs text-text-muted ml-2 uppercase border border-glass-border px-1 rounded">
-                          {blockContent.type === 'chords' ? 'Chords' : 'Melody'}
-                        </span>
-                      </h3>
-                      {/* Per-Section Mic Button - Only for Melody */}
-                      {blockContent.type !== 'chords' && (
+              {/* Controls & Input */}
+              <div className="flex flex-col gap-6">
+
+                <div className="flex flex-col gap-6">
+                  <div className="flex justify-between items-center">
+                    <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
+                      Melody Sections
+                    </label>
+                    <div className="flex gap-2">
+                      <button onClick={() => addBlock('melody')} className="text-xs bg-teal-600 hover:bg-teal-500 px-3 py-1 rounded transition-colors text-white font-semibold">
+                        + Melody
+                      </button>
+                      <button onClick={() => addBlock('chords')} className="text-xs bg-indigo-600 hover:bg-indigo-500 px-3 py-1 rounded transition-colors text-white font-semibold">
+                        + Chords
+                      </button>
+                    </div>
+                  </div>
+
+                  {blocks.map((blockContent, index) => (
+                    <div key={index} className="glass-panel p-4 rounded-xl border border-glass-border bg-base-100/30">
+                      <div className="flex justify-between items-center mb-2">
+                        <div className="flex items-center gap-2">
+                          <h3 className="font-semibold text-teal-400">
+                            Section {index + 1}
+                            <span className="text-xs text-text-muted ml-2 uppercase border border-glass-border px-1 rounded">
+                              {blockContent.type === 'chords' ? 'Chords' : 'Melody'}
+                            </span>
+                          </h3>
+                        </div>
+
                         <button
-                          onClick={() => toggleMic(index)}
-                          className={`flex items - center justify - center w - 8 h - 8 rounded - full transition - all shadow
-                            ${recordingBlockIndex === index
-                              ? 'bg-red-500 text-white animate-pulse'
-                              : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                            } `}
-                          title={recordingBlockIndex === index ? "Stop Recording" : "Record to this section"}
+                          onClick={() => removeBlock(index)}
+                          className="text-gray-500 hover:text-red-400 transition-colors text-sm"
                         >
-                          {recordingBlockIndex === index ? (
-                            <span className="text-xs">{detectedNoteLabel || "..."}</span>
-                          ) : (
-                            "🎤"
-                          )}
+                          Remove
                         </button>
+                      </div>
+
+                      <textarea
+                        value={blockContent.content || (typeof blockContent === 'string' ? blockContent : "")}
+                        onChange={(e) => updateBlock(index, e.target.value)}
+                        onFocus={() => setSelectionInfo(prev => ({ ...prev, blockIndex: index }))}
+                        onSelect={(e) => {
+                          setSelectionInfo({
+                            blockIndex: index,
+                            text: e.target.value.substring(e.target.selectionStart, e.target.selectionEnd)
+                          });
+                        }}
+                        className="w-full min-h-[120px] bg-bg-primary p-3 rounded-lg border border-glass-border focus:border-teal-500 focus:outline-none font-mono text-lg resize-y mb-4"
+                        placeholder="Enter notes (e.g., 1 2 3)"
+                      />
+
+                      {/* INTEGRATED VISUALIZATION */}
+                      {parsedBlocks[index] && (
+                        <div className="bg-white rounded-lg p-2 relative group-vis">
+                          {/* Label for the section */}
+                          <div className="absolute top-1 left-2 text-gray-400 text-[8px] font-bold uppercase tracking-widest pointer-events-none z-10">
+                            Visual Output
+                          </div>
+
+                          {/* Download Button */}
+                          <button
+                            onClick={() => handleDownloadSection(index)}
+                            className="absolute top-1 right-1 bg-gray-100 hover:bg-gray-200 text-gray-600 p-1.5 rounded transition-all opacity-0 group-hover:opacity-100 z-10"
+                            title="Download SVG"
+                          >
+                            <svg width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                            </svg>
+                          </button>
+
+                          <div className="overflow-x-auto w-full custom-scrollbar">
+                            {parsedBlocks[index].type === 'chords' ? (
+                              // Chords Rendering
+                              <div style={{ width: Math.max(100, (parsedBlocks[index].chars.length * kerning) + 40), height: 80 }} className="relative mx-auto text-black">
+                                <svg
+                                  ref={el => svgRefs.current[index] = el}
+                                  width={Math.max(100, (parsedBlocks[index].chars.length * kerning) + 40)}
+                                  height={80}
+                                  xmlns="http://www.w3.org/2000/svg"
+                                >
+                                  {parsedBlocks[index].chars.map((char, cIdx) => (
+                                    <text key={cIdx} x={20 + (cIdx * kerning)} y="50" textAnchor="middle" fill="#000000" fontWeight="bold" fontFamily="monospace" fontSize="22">{char}</text>
+                                  ))}
+                                </svg>
+                              </div>
+                            ) : (
+                              // Melody Rendering
+                              (() => {
+                                const { width: vW, height: vH, baseY: vB } = calculateCanvasSize(parsedBlocks[index].notes);
+                                return (
+                                  <div style={{ width: vW, height: vH, minWidth: '100%' }} className="relative text-black">
+                                    <svg
+                                      ref={el => svgRefs.current[index] = el}
+                                      width={vW}
+                                      height={vH}
+                                      xmlns="http://www.w3.org/2000/svg"
+                                    >
+                                      {parsedBlocks[index].notes.filter(item => item.type === 'note').map((item, nIdx, array) => {
+                                        const x = 20 + nIdx * kerning;
+                                        const y = vB - (item.pitchIndex * verticalScale);
+
+                                        // Beaming info
+                                        const nextItem = array[nIdx + 1];
+                                        let nextY = y;
+                                        let nextX = x;
+                                        if (nextItem) {
+                                          nextY = vB - (nextItem.pitchIndex * verticalScale);
+                                          nextX = 20 + (nIdx + 1) * kerning;
+                                        }
+
+                                        return (
+                                          <g key={nIdx}>
+                                            <text x={x} y={y} dy="0.35em" textAnchor="middle" fill="#000000" fontWeight="500" fontFamily="sans-serif" fontSize="24">{item.note}</text>
+
+                                            {item.elementMetadata?.dotCount > 0 && <circle cx={x + 14} cy={y} r={2.5} fill="#000000" />}
+
+                                            {item.elementMetadata?.dashCount > 0 && Array.from({ length: item.elementMetadata.dashCount }).map((_, di) => (
+                                              <text key={`dash-${di}`} x={x + 24 + (di * 20)} y={y} dy="0.35em" textAnchor="middle" fill="#000000" fontSize="24">-</text>
+                                            ))}
+
+                                            {item.elementMetadata?.underscoreCount >= 1 && (
+                                              <>
+                                                <line x1={x - 8} y1={y + 14} x2={x + 8} y2={y + 14} stroke="#000000" strokeWidth="2" />
+                                                {nextItem?.elementMetadata?.underscoreCount >= 1 && (
+                                                  <line x1={x + 8} y1={y + 14} x2={nextX - 8} y2={nextY + 14} stroke="#000000" strokeWidth="2" />
+                                                )}
+                                              </>
+                                            )}
+                                            {item.elementMetadata?.underscoreCount >= 2 && (
+                                              <>
+                                                <line x1={x - 8} y1={y + 20} x2={x + 8} y2={y + 20} stroke="#000000" strokeWidth="2" />
+                                                {nextItem?.elementMetadata?.underscoreCount >= 2 && (
+                                                  <line x1={x + 8} y1={y + 20} x2={nextX - 8} y2={nextY + 20} stroke="#000000" strokeWidth="2" />
+                                                )}
+                                              </>
+                                            )}
+                                          </g>
+                                        );
+                                      })}
+                                    </svg>
+                                  </div>
+                                );
+                              })()
+                            )}
+                          </div>
+                        </div>
                       )}
                     </div>
+                  ))}
 
-                    <button
-                      onClick={() => removeBlock(index)}
-                      className="text-gray-500 hover:text-red-400 transition-colors text-sm"
+
+                  <div className="flex flex-col gap-2 flex-1 mt-4">
+                    <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
+                      Key / Mode
+                    </label>
+                    <select
+                      value={selectedKeyIndex}
+                      onChange={(e) => setSelectedKeyIndex(Number(e.target.value))}
+                      className="w-full h-full font-mono text-lg bg-bg-secondary border border-glass-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-teal-500"
                     >
-                      Remove
-                    </button>
+                      {SCALE_TYPES.map((scale, index) => (
+                        <option key={scale.name} value={index}>{scale.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+
+                <div className="flex flex-col md:flex-row gap-8">
+                  <div className="flex flex-col gap-2 flex-1">
+                    <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
+                      Horizontal Spacing: {kerning}px
+                    </label>
+                    <input
+                      type="range"
+                      min="10"
+                      max="100"
+                      value={kerning}
+                      onChange={(e) => setKerning(Number(e.target.value))}
+                      className="w-full cursor-pointer accent-teal-500 h-2 bg-bg-secondary rounded-lg appearance-none"
+                    />
                   </div>
 
-                  <textarea
-                    value={blockContent.content || (typeof blockContent === 'string' ? blockContent : "")}
-                    onChange={(e) => updateBlock(index, e.target.value)}
-                    className="w-full h-24 bg-bg-primary p-3 rounded-lg border border-glass-border focus:border-teal-500 focus:outline-none font-mono text-lg resize-y mb-2"
-                    placeholder="Enter notes (e.g., 1 2 3)"
-                  />
+                  <div className="flex flex-col gap-2 flex-1">
+                    <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
+                      Vertical Scale: {verticalScale}px
+                    </label>
+                    <input
+                      type="range"
+                      min="0"
+                      max="50"
+                      value={verticalScale}
+                      onChange={(e) => setVerticalScale(Number(e.target.value))}
+                      className="w-full cursor-pointer accent-teal-500 h-2 bg-bg-secondary rounded-lg appearance-none"
+                    />
+                  </div>
                 </div>
-              ))}
-
-
-              <div className="flex flex-col gap-2 flex-1 mt-4">
-                <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
-                  Key / Mode
-                </label>
-                <select
-                  value={selectedKeyIndex}
-                  onChange={(e) => setSelectedKeyIndex(Number(e.target.value))}
-                  className="w-full h-full font-mono text-lg bg-bg-secondary border border-glass-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-teal-500"
-                >
-                  {SCALE_TYPES.map((scale, index) => (
-                    <option key={scale.name} value={index}>{scale.name}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-
-            <div className="flex flex-col md:flex-row gap-8">
-              <div className="flex flex-col gap-2 flex-1">
-                <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
-                  Horizontal Spacing: {kerning}px
-                </label>
-                <input
-                  type="range"
-                  min="10"
-                  max="100"
-                  value={kerning}
-                  onChange={(e) => setKerning(Number(e.target.value))}
-                  className="w-full cursor-pointer accent-teal-500 h-2 bg-bg-secondary rounded-lg appearance-none"
-                />
               </div>
 
-              <div className="flex flex-col gap-2 flex-1">
-                <label className="text-teal-400 font-semibold text-sm uppercase tracking-wider">
-                  Vertical Scale: {verticalScale}px
-                </label>
-                <input
-                  type="range"
-                  min="0"
-                  max="50"
-                  value={verticalScale}
-                  onChange={(e) => setVerticalScale(Number(e.target.value))}
-                  className="w-full cursor-pointer accent-teal-500 h-2 bg-bg-secondary rounded-lg appearance-none"
-                />
-              </div>
             </div>
           </div>
 
-          {/* Visualization Output - Multiple Stacked SVGs */}
-          <div className="flex flex-col gap-4">
-
-            {parsedBlocks.map((blockResult, bIndex) => {
-              if (blockResult.type === 'chords') {
-                // CHORDS RENDERING
-                // Simple width calculation: char count * kerning + padding
-                const width = Math.max(100, (blockResult.chars.length * kerning) + 40);
-                const height = 100; // Fixed height for chords
-
-                return (
-                  <div key={bIndex} className="rounded-xl overflow-hidden bg-white shadow-xl border-4 border-indigo-100 relative group">
-                    <div className="absolute top-2 left-2 text-indigo-400 text-xs font-bold uppercase tracking-widest pointer-events-none">
-                      Section {bIndex + 1} (Chords)
-                    </div>
-
-                    {/* Download Button (Appears on Hover) */}
-                    <button
-                      onClick={() => handleDownloadSection(bIndex)}
-                      className="absolute top-2 right-2 bg-gray-100 hover:bg-gray-200 text-gray-600 p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 z-10"
-                      title="Download SVG"
-                    >
-                      <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                      </svg>
-                    </button>
-
-                    <div className="overflow-x-auto">
-                      <div style={{ width: width, height: height }} className="relative mx-auto bg-white text-black">
-                        <svg
-                          ref={el => svgRefs.current[bIndex] = el}
-                          width={width}
-                          height={height}
-                          xmlns="http://www.w3.org/2000/svg"
-                          className="block"
-                        >
-                          {blockResult.chars.map((char, index) => (
-                            <text
-                              key={index}
-                              x={20 + (index * kerning)}
-                              y="60"
-                              textAnchor="middle"
-                              fill="#000000"
-                              fontWeight="bold"
-                              fontFamily="monospace"
-                              fontSize="24" // Larger for chords?
-                            >
-                              {char}
-                            </text>
-                          ))}
-                        </svg>
-                      </div>
-                    </div>
-                  </div>
-                );
-              }
-
-              // MELODY RENDERING
-              const { width, height, baseY } = calculateCanvasSize(blockResult.notes);
-              return (
-                <div key={bIndex} className="rounded-xl overflow-hidden bg-white shadow-xl border-4 border-white relative group">
-                  {/* Label for the section */}
-                  <div className="absolute top-2 left-2 text-gray-400 text-xs font-bold uppercase tracking-widest pointer-events-none">
-                    Section {bIndex + 1}
-                  </div>
-
-                  {/* Download Button (Appears on Hover) */}
+          {/* Footer Controls - Fixed at bottom of panel */}
+          <div className="flex-shrink-0 bg-bg-secondary p-4 border-t border-glass-border flex flex-col md:flex-row justify-between items-center gap-4 z-20">
+            <div className="flex items-center gap-4 w-full md:w-auto">
+              <div className="flex flex-col gap-4 w-full md:w-auto">
+                <div className="flex items-center gap-2">
                   <button
-                    onClick={() => handleDownloadSection(bIndex)}
-                    className="absolute top-2 right-2 bg-gray-100 hover:bg-gray-200 text-gray-600 p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 z-10"
-                    title="Download SVG"
+                    onClick={playMelody}
+                    onMouseDown={(e) => e.preventDefault()}
+                    className={`flex items-center gap-2 px-6 py-2 rounded-lg font-semibold transition-all shadow-lg flex-1 justify-center
+                    ${isPlaying
+                        ? 'bg-orange-500 text-white animate-pulse'
+                        : 'bg-teal-500 text-bg-primary hover:bg-teal-400'
+                      } `}
                   >
-                    <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                    <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
+                      <path d="M8 5v14l11-7z" />
+                    </svg>
+                    {isPlaying ? 'Playing...' : 'Play'}
+                  </button>
+
+                  <button
+                    onClick={stopMelody}
+                    className={`flex items-center justify-center w-12 h-10 rounded-lg transition-all shadow-lg
+                    ${isPlaying
+                        ? 'bg-red-500 text-white hover:bg-red-400'
+                        : 'bg-gray-700 text-gray-500 hover:bg-gray-600'
+                      }`}
+                    title="Stop"
+                  >
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                      <rect x="6" y="6" width="12" height="12" rx="1" />
                     </svg>
                   </button>
 
-                  <div className="overflow-x-auto">
-                    <div style={{ width: width, height: height }} className="relative mx-auto bg-white text-black">
-                      {blockResult.notes.length === 0 ? (
-                        <div className="absolute inset-0 flex items-center justify-center text-gray-400 font-sans opacity-50">
-                          ...
-                        </div>
-                      ) : (
-                        <svg
-                          ref={el => svgRefs.current[bIndex] = el}
-                          width={width}
-                          height={height}
-                          xmlns="http://www.w3.org/2000/svg"
-                          className="block"
-                        >
-                          {blockResult.notes.filter(item => item.type === 'note').map((item, index, array) => {
-                            const x = 20 + index * kerning;
-                            const y = baseY - (item.pitchIndex * verticalScale);
-                            const match = item.note.match(/^([A-Ga-g1-7])([#b]?)/);
-                            let base = item.note;
-                            let acc = '';
-                            if (match) { base = match[1]; acc = match[2]; }
+                  <label className="flex items-center gap-2 text-xs text-white cursor-pointer select-none bg-bg-secondary px-3 py-2 rounded-lg border border-glass-border hover:border-teal-500 transition-colors whitespace-nowrap">
+                    <input
+                      type="checkbox"
+                      checked={playOnlySelected}
+                      onChange={(e) => setPlayOnlySelected(e.target.checked)}
+                      className="accent-teal-500 w-4 h-4"
+                    />
+                    Selected Melody
+                  </label>
 
-                            // Check next note for beaming
-                            const nextItem = array[index + 1];
-                            let nextY = y;
-                            let nextX = x;
-                            if (nextItem) {
-                              nextY = baseY - (nextItem.pitchIndex * verticalScale);
-                              nextX = 20 + (index + 1) * kerning;
-                            }
-
-                            return (
-                              <g key={index}>
-                                <text x={x} y={y} dy="0.35em" textAnchor="middle" fill="#000000" fontWeight="500" fontFamily="sans-serif" fontSize="24">{base}</text>
-                                {acc && <text x={x + 10} y={y - 8} textAnchor="start" fill="#000000" fontWeight="bold" fontFamily="sans-serif" fontSize="14">{acc}</text>}
-
-                                {/* Dotted Note Indicator */}
-                                {item.elementMetadata?.dotCount > 0 && (
-                                  <circle cx={x + 14} cy={y} r={2.5} fill="#000000" />
-                                )}
-
-                                {/* Duration Dashes (for half/whole notes) */}
-                                {item.elementMetadata?.dashCount > 0 && Array.from({ length: item.elementMetadata.dashCount }).map((_, i) => (
-                                  <text
-                                    key={`dash-${i}`}
-                                    x={x + 24 + (i * 20)}
-                                    y={y}
-                                    dy="0.35em"
-                                    textAnchor="middle"
-                                    fill="#000000"
-                                    fontWeight="normal"
-                                    fontFamily="sans-serif"
-                                    fontSize="24"
-                                  >
-                                    -
-                                  </text>
-                                ))}
-
-                                {/* Duration Underlines (Beams) */}
-                                {/* Level 1 (8th notes) */}
-                                {item.elementMetadata?.underscoreCount >= 1 && (
-                                  <>
-                                    <line x1={x - 8} y1={y + 14} x2={x + 8} y2={y + 14} stroke="#000000" strokeWidth="2" />
-                                    {nextItem?.elementMetadata?.underscoreCount >= 1 && (
-                                      <line x1={x + 8} y1={y + 14} x2={nextX - 8} y2={nextY + 14} stroke="#000000" strokeWidth="2" />
-                                    )}
-                                  </>
-                                )}
-
-                                {/* Level 2 (16th notes) */}
-                                {item.elementMetadata?.underscoreCount >= 2 && (
-                                  <>
-                                    <line x1={x - 8} y1={y + 20} x2={x + 8} y2={y + 20} stroke="#000000" strokeWidth="2" />
-                                    {nextItem?.elementMetadata?.underscoreCount >= 2 && (
-                                      <line x1={x + 8} y1={y + 20} x2={nextX - 8} y2={nextY + 20} stroke="#000000" strokeWidth="2" />
-                                    )}
-                                  </>
-                                )}
-                              </g>
-                            );
-                          })}
-                        </svg>
-                      )}
-                    </div>
-                  </div>
+                  <label className="flex items-center gap-2 text-xs text-white cursor-pointer select-none bg-bg-secondary px-3 py-2 rounded-lg border border-glass-border hover:border-teal-500 transition-colors whitespace-nowrap">
+                    <input
+                      type="checkbox"
+                      checked={isLooping}
+                      onChange={(e) => setIsLooping(e.target.checked)}
+                      className="accent-teal-500 w-4 h-4"
+                    />
+                    Loop
+                  </label>
                 </div>
-              );
-            })}
-          </div>
 
-          {/* Footer Controls */}
-          <div className="flex flex-col md:flex-row justify-between items-center bg-bg-secondary p-4 rounded-lg border border-glass-border md:gap-4 gap-4">
-            <div className="flex flex-col md:flex-row items-center gap-4 w-full md:w-auto">
-              <button
-                onClick={playMelody}
-                disabled={isPlaying}
-                className={`flex items - center gap - 2 px - 6 py - 2 rounded - lg font - semibold transition - all shadow - lg w - full md: w - auto justify - center
-                  ${isPlaying
-                    ? 'bg-red-500 text-white animate-pulse'
-                    : 'bg-teal-500 text-bg-primary hover:bg-teal-400'
-                  } `}
-              >
-                <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
-                  {isPlaying ? (
-                    <rect x="6" y="4" width="4" height="16" rx="1" />
-                  ) : (
-                    <path d="M8 5v14l11-7z" />
-                  )}
-                  {isPlaying && <rect x="14" y="4" width="4" height="16" rx="1" />}
-                </svg>
-                {isPlaying ? 'Playing...' : 'Play Sequence'}
-              </button>
-
-              <div className="flex items-center gap-2">
-                <label className="text-sm font-semibold text-text-muted whitespace-nowrap">Tempo:</label>
-                <select
-                  value={bpm}
-                  onChange={(e) => setBpm(Number(e.target.value))}
-                  className="bg-bg-primary border border-glass-border rounded px-2 py-1 text-white text-sm focus:outline-none focus:border-teal-500"
-                  style={{ width: '80px', padding: '0.4rem' }}
-                >
-                  {Array.from({ length: 17 }, (_, i) => 60 + (i * 5)).map(b => (
-                    <option key={b} value={b}>{b} BPM</option>
-                  ))}
-                </select>
+                <div className="flex flex-col gap-1">
+                  <div className="flex justify-between items-center text-xs text-text-muted font-bold uppercase tracking-wider">
+                    <span>Tempo</span>
+                    <span className="text-teal-400">{bpm} BPM</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="60"
+                    max="160"
+                    step="1"
+                    value={bpm}
+                    onChange={(e) => setBpm(Number(e.target.value))}
+                    className="w-full h-4 bg-bg-primary rounded-lg cursor-pointer accent-teal-500 border border-glass-border"
+                    style={{ minWidth: '150px' }}
+                  />
+                </div>
               </div>
             </div>
 

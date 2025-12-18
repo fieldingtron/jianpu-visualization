@@ -94,3 +94,25 @@ select option {
   background-color: var(--bg-secondary);
   color: var(--text-main);
 }
+
+/* Custom Scrollbar for long melodies */
+.custom-scrollbar::-webkit-scrollbar {
+  height: 8px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+  border-radius: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: var(--glass-border);
+  border-radius: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-primary);
+}
+
+/* Ensure long content is contained */
+.glass-panel {
+  max-width: 100%;
+  overflow-x: hidden;
+}
