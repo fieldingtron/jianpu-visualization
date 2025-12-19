@@ -23,19 +23,15 @@ body {
     radial-gradient(circle at 90% 80%, rgba(78, 204, 163, 0.1) 0%, transparent 20%);
   color: var(--text-main);
   min-height: 100vh;
-  display: flex;
-  justify-content: center;
-  align-items: center;
   overflow-x: hidden;
   margin: 0;
 }
 
 #root {
   width: 100%;
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 2rem;
-  text-align: center;
+  height: 100vh;
+  margin: 0;
+  padding: 0;
 }
 
 /* Glassmorphism Utilities */

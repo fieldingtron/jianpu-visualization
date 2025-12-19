@@ -1,6 +1,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import * as Tone from 'tone';
+import { Midi } from '@tonejs/midi';
 import { turso } from './tursoClient';
 
 const NOTE_MAP = {
@@ -99,11 +100,12 @@ function App() {
     try {
       // Fetch all, we'll filter UI actions by owner_id on the client
       const result = await turso.execute("SELECT * FROM melodies ORDER BY created_at DESC LIMIT 50");
-      setLibrary(result.rows);
+      setLibrary(result.rows || []);
       setDbError(null);
     } catch (e) {
       console.error("Failed to load library:", e);
-      setDbError("Could not connect to database. Check credentials.");
+      setDbError("Could not connect to database. Working offline.");
+      setLibrary([]);
     }
   };
 
@@ -387,6 +389,84 @@ function App() {
     document.body.removeChild(link);
   };
 
+
+  const handleSVGContextMenu = (e, index) => {
+    e.preventDefault();
+    handleDownloadSection(index);
+  };
+
+  const handleImportMIDI = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const midi = new Midi(arrayBuffer);
+
+      // Get the first track with notes
+      const track = midi.tracks.find(t => t.notes.length > 0);
+      if (!track) {
+        alert('No notes found in MIDI file');
+        return;
+      }
+
+      // Convert MIDI to Jianpu notation
+      const jianpuNotes = [];
+      const currentScale = SCALE_TYPES[selectedKeyIndex] || SCALE_TYPES[0];
+      const rootMidi = Tone.Frequency(currentScale.root + "4").toMidi();
+
+      track.notes.forEach(note => {
+        const midiNote = note.midi;
+        const duration = note.duration;
+
+        // Calculate scale degree relative to the key
+        const semitonesFromRoot = ((midiNote - rootMidi) % 12 + 12) % 12;
+        const octaveOffset = Math.floor((midiNote - rootMidi) / 12);
+
+        // Map semitones to scale degree
+        const semitoneMap = { 0: '1', 2: '2', 4: '3', 5: '4', 7: '5', 9: '6', 11: '7' };
+        let degree = semitoneMap[semitonesFromRoot];
+
+        if (!degree) {
+          // Handle chromatic notes (sharps/flats)
+          const sharpMap = { 1: '1#', 3: '2#', 6: '4#', 8: '5#', 10: '6#' };
+          degree = sharpMap[semitonesFromRoot] || '1';
+        }
+
+        // Add octave markers
+        if (octaveOffset > 0) {
+          degree += "'".repeat(octaveOffset);
+        } else if (octaveOffset < 0) {
+          degree += ",".repeat(Math.abs(octaveOffset));
+        }
+
+        // Add duration markers (simplified - quarter note is default)
+        if (duration <= 0.25) {
+          degree += '_'; // Eighth note
+        } else if (duration <= 0.125) {
+          degree += '__'; // Sixteenth note
+        } else if (duration >= 0.75 && duration <= 1) {
+          degree += '.'; // Dotted note
+        } else if (duration > 1) {
+          const dashes = Math.floor(duration) - 1;
+          degree += '-'.repeat(dashes);
+        }
+
+        jianpuNotes.push(degree);
+      });
+
+      // Add as a new melody block
+      const newBlock = { type: 'melody', content: jianpuNotes.join(' ') };
+      setBlocks([...blocks, newBlock]);
+
+      // Reset file input
+      e.target.value = '';
+    } catch (error) {
+      console.error('Error importing MIDI:', error);
+      alert('Failed to import MIDI file. Please try another file.');
+    }
+  };
+
   // Key Signature Logic
   // selectedKeyIndex is defined above with Refs
 
@@ -646,6 +726,15 @@ function App() {
                       <button onClick={() => addBlock('chords')} className="text-xs bg-indigo-600 hover:bg-indigo-500 px-3 py-1 rounded transition-colors text-white font-semibold">
                         + Chords
                       </button>
+                      <label className="text-xs bg-purple-600 hover:bg-purple-500 px-3 py-1 rounded transition-colors text-white font-semibold cursor-pointer">
+                        Import MIDI
+                        <input
+                          type="file"
+                          accept=".mid,.midi"
+                          onChange={handleImportMIDI}
+                          className="hidden"
+                        />
+                      </label>
                     </div>
                   </div>
 
@@ -705,7 +794,11 @@ function App() {
                           <div className="overflow-x-auto w-full custom-scrollbar">
                             {parsedBlocks[index].type === 'chords' ? (
                               // Chords Rendering
-                              <div style={{ width: Math.max(100, (parsedBlocks[index].chars.length * kerning) + 40), height: 80 }} className="relative mx-auto text-black">
+                              <div
+                                style={{ width: Math.max(100, (parsedBlocks[index].chars.length * kerning) + 40), height: 80 }}
+                                className="relative mx-auto text-black"
+                                onContextMenu={(e) => handleSVGContextMenu(e, index)}
+                              >
                                 <svg
                                   ref={el => svgRefs.current[index] = el}
                                   width={Math.max(100, (parsedBlocks[index].chars.length * kerning) + 40)}
@@ -722,7 +815,11 @@ function App() {
                               (() => {
                                 const { width: vW, height: vH, baseY: vB } = calculateCanvasSize(parsedBlocks[index].notes);
                                 return (
-                                  <div style={{ width: vW, height: vH, minWidth: '100%' }} className="relative text-black">
+                                  <div
+                                    style={{ width: vW, height: vH, minWidth: '100%' }}
+                                    className="relative text-black"
+                                    onContextMenu={(e) => handleSVGContextMenu(e, index)}
+                                  >
                                     <svg
                                       ref={el => svgRefs.current[index] = el}
                                       width={vW}
